@@ -1,0 +1,112 @@
+body { margin: 0; background: #f5f7fb; }
+#root { min-height: 100vh; }
+.page { padding: 20px; max-width: 1320px; margin: 0 auto; }
+.page-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+.page-header .ant-typography { margin-right: auto; }
+.page-header-actions { flex-wrap: wrap; justify-content: flex-end; }
+.card { margin-bottom: 16px; }
+.mobile-list .ant-card { border-radius: 10px; }
+.login-page { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: linear-gradient(160deg, #eef4ff 0%, #f8fbff 45%, #f5f7fb 100%); }
+.login-card { width: min(92vw, 420px); box-shadow: 0 16px 50px rgba(20, 45, 90, 0.12); border-radius: 14px; }
+.result-ok { color: #1677ff; }
+.result-err { color: #ff4d4f; }
+
+@media (max-width: 1024px) {
+  .page {
+    padding: 14px;
+  }
+  .page-header {
+    align-items: flex-start;
+  }
+  .page-header-actions {
+    max-width: 55%;
+  }
+  .card .ant-table-wrapper {
+    overflow-x: auto;
+  }
+  .card .ant-table {
+    min-width: 760px;
+  }
+}
+
+@media (max-width: 768px) {
+  .page {
+    padding: 10px;
+  }
+  .page-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+  .page-header .ant-typography {
+    margin-right: 0;
+    font-size: 22px !important;
+    line-height: 1.2;
+  }
+  .page-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .card .ant-card-head-title {
+    font-size: 15px;
+  }
+  .card .ant-space {
+    row-gap: 8px;
+  }
+  .mobile-list .ant-card-body {
+    padding: 12px;
+  }
+  .card .ant-form-inline {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+  }
+  .card .ant-form-inline .ant-form-item {
+    margin-right: 0;
+    margin-bottom: 8px;
+    width: 100%;
+  }
+  .card .ant-form-inline .ant-form-item-control,
+  .card .ant-form-inline .ant-input,
+  .card .ant-form-inline .ant-input-number,
+  .card .ant-form-inline .ant-select {
+    width: 100% !important;
+  }
+  .ant-tabs-tab {
+    padding: 10px 12px !important;
+  }
+  .ant-modal {
+    max-width: calc(100vw - 16px) !important;
+    margin: 8px auto !important;
+  }
+  .ant-modal .ant-modal-content {
+    border-radius: 12px;
+  }
+  .ant-modal .ant-modal-body {
+    max-height: 72vh;
+    overflow: auto;
+  }
+  .ant-modal .ant-form-inline .ant-form-item {
+    width: 100%;
+    margin-right: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .page {
+    padding: 8px;
+  }
+  .login-page {
+    padding: 14px;
+  }
+  .login-card {
+    width: 100%;
+  }
+  .card .ant-btn {
+    min-height: 34px;
+  }
+  .card .ant-tag {
+    margin-bottom: 6px;
+  }
+}

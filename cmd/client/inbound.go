@@ -5,6 +5,9 @@ import (
 	"context"
 	"net"
 	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
@@ -17,7 +20,101 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-func handleTcpConnection(ctx context.Context, c net.Conn, s *myClient) {
+type inboundHandler interface {
+	NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error
+	NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error
+}
+
+type proxyErrorLogger struct {
+	mu         sync.Mutex
+	nextLogAt  time.Time
+	suppressed int
+	lastMsg    string
+}
+
+func (l *proxyErrorLogger) log(err error) {
+	if err == nil {
+		return
+	}
+	now := time.Now()
+	msg := err.Error()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if now.Before(l.nextLogAt) {
+		l.suppressed++
+		l.lastMsg = msg
+		return
+	}
+
+	if l.suppressed > 0 {
+		logrus.Errorf("CreateProxy: %s (suppressed %d repeats)", l.lastMsg, l.suppressed)
+	}
+	logrus.Errorln("CreateProxy:", err)
+	l.lastMsg = msg
+	l.nextLogAt = now.Add(2 * time.Second)
+	l.suppressed = 0
+}
+
+var createProxyErrLogger proxyErrorLogger
+
+type inboundConnTracker struct {
+	mu    sync.Mutex
+	conns map[net.Conn]struct{}
+}
+
+var liveInboundConns inboundConnTracker
+
+func trackInboundConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	liveInboundConns.mu.Lock()
+	if liveInboundConns.conns == nil {
+		liveInboundConns.conns = make(map[net.Conn]struct{}, 128)
+	}
+	liveInboundConns.conns[conn] = struct{}{}
+	liveInboundConns.mu.Unlock()
+}
+
+func untrackInboundConn(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	liveInboundConns.mu.Lock()
+	delete(liveInboundConns.conns, conn)
+	liveInboundConns.mu.Unlock()
+}
+
+func closeAllInboundConnections(reason string) int {
+	liveInboundConns.mu.Lock()
+	if len(liveInboundConns.conns) == 0 {
+		liveInboundConns.mu.Unlock()
+		return 0
+	}
+	conns := make([]net.Conn, 0, len(liveInboundConns.conns))
+	for conn := range liveInboundConns.conns {
+		conns = append(conns, conn)
+	}
+	liveInboundConns.mu.Unlock()
+
+	closed := 0
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		if err := conn.Close(); err == nil {
+			closed++
+		}
+	}
+	if closed > 0 {
+		logrus.Warnf("[Client] inbound connections closed: count=%d reason=%s", closed, strings.TrimSpace(reason))
+	}
+	return closed
+}
+
+func handleTcpConnection(ctx context.Context, c net.Conn, handler inboundHandler) {
 	defer func() {
 		if r := recover(); r != nil {
 			logrus.Errorln("[BUG]", r, string(debug.Stack()))
@@ -38,9 +135,9 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myClient) {
 
 	switch headerBytes[0] {
 	case socks4.Version, socks5.Version:
-		socks.HandleConnection0(ctx, c, reader, nil, s, metadata)
+		_ = socks.HandleConnection0(ctx, c, reader, nil, handler, metadata)
 	default:
-		http.HandleConnection(ctx, c, reader, nil, s, metadata)
+		_ = http.HandleConnection(ctx, c, reader, nil, handler, metadata)
 	}
 }
 
@@ -49,7 +146,7 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myClient) {
 func (c *myClient) NewConnection(ctx context.Context, conn net.Conn, metadata M.Metadata) error {
 	proxyC, err := c.CreateProxy(ctx, metadata.Destination)
 	if err != nil {
-		logrus.Errorln("CreateProxy:", err)
+		createProxyErrLogger.log(err)
 		return err
 	}
 	defer proxyC.Close()
@@ -60,7 +157,7 @@ func (c *myClient) NewConnection(ctx context.Context, conn net.Conn, metadata M.
 func (c *myClient) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
 	proxyC, err := c.CreateProxy(ctx, uot.RequestDestination(2))
 	if err != nil {
-		logrus.Errorln("CreateProxy:", err)
+		createProxyErrLogger.log(err)
 		return err
 	}
 	defer proxyC.Close()

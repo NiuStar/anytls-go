@@ -132,6 +132,11 @@ func (s *Stream) RemoteAddr() net.Addr {
 	return nil
 }
 
+// ClientSetting returns the value sent by client cmdSettings.
+func (s *Stream) ClientSetting(key string) string {
+	return s.sess.ClientSetting(key)
+}
+
 // HandshakeFailure should be called when Server fail to create outbound proxy
 func (s *Stream) HandshakeFailure(err error) error {
 	var once bool

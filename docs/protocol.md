@@ -84,6 +84,8 @@ cmdSYNACK 若不带有 data，则表示代理 stream 握手成功。若带有 da
 v=2
 client=anytls/0.0.1
 padding-md5=(md5)
+egress-ip=(optional ip)
+egress-rule=(optional rule string)
 ```
 
 > 采用 UTF-8 编码，key 与 value 之间用 `=` 连接，两者均为 string 类型。不同项目之间用 `\n` 分割。
@@ -91,6 +93,8 @@ padding-md5=(md5)
 - `v` 是客户端实现的协议版本号 （目前为 `2`）
 - `client` 是客户端软件名称与版本号（第三方实现请填写真实的软件名称与版本号，伪装没有任何意义）
 - `padding-md5` 是客户端当前 `paddingScheme` 的 md5 （小写 hex 编码）
+- `egress-ip` 是可选参数，用于请求服务器代理出站时绑定该源 IP（字符串形式的 IP 地址）
+- `egress-rule` 是可选参数，用于按目标地址匹配出口 IP。命中规则时优先于 `egress-ip`，未命中时回退到 `egress-ip`
 
 #### cmdServerSettings
 

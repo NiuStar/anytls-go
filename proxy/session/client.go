@@ -24,7 +24,8 @@ type Client struct {
 	die       context.Context
 	dieCancel context.CancelFunc
 
-	dialOut util.DialOutFunc
+	dialOut  util.DialOutFunc
+	settings util.StringMap
 
 	sessionCounter atomic.Uint64
 
@@ -38,10 +39,16 @@ type Client struct {
 
 	idleSessionTimeout time.Duration
 	minIdleSession     int
+
+	createFailureLock   sync.Mutex
+	createFailureCount  int
+	createNextAllowedAt time.Time
+	createLastErr       error
+	createProbeInflight bool
 }
 
 func NewClient(ctx context.Context, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int, settings util.StringMap,
 ) *Client {
 	c := &Client{
 		sessions:           make(map[uint64]*Session),
@@ -49,6 +56,7 @@ func NewClient(ctx context.Context, dialOut util.DialOutFunc,
 		padding:            _padding,
 		idleSessionTimeout: idleSessionTimeout,
 		minIdleSession:     minIdleSession,
+		settings:           settings,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -75,7 +83,7 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 
 	session = c.getIdleSession()
 	if session == nil {
-		session, err = c.createSession(ctx)
+		session, err = c.createSessionWithBackoff(ctx)
 		if session != nil && clientDebugSessionPool {
 			logrus.Infoln("create session:", session.seq)
 		}
@@ -125,6 +133,92 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	return stream, nil
 }
 
+func (c *Client) createSessionWithBackoff(ctx context.Context) (*Session, error) {
+	for {
+		releaseProbe, wait, lastErr := c.beginCreateAttempt()
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				if lastErr != nil {
+					return nil, fmt.Errorf("%w (last upstream error: %v)", ctx.Err(), lastErr)
+				}
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+
+		session, err := c.createSession(ctx)
+		c.finishCreateAttempt(err)
+		if releaseProbe != nil {
+			releaseProbe()
+		}
+		if err != nil {
+			return nil, err
+		}
+		return session, nil
+	}
+}
+
+func (c *Client) beginCreateAttempt() (releaseProbe func(), wait time.Duration, lastErr error) {
+	now := time.Now()
+	c.createFailureLock.Lock()
+	defer c.createFailureLock.Unlock()
+
+	if c.createFailureCount <= 0 {
+		return nil, 0, nil
+	}
+	lastErr = c.createLastErr
+	if now.Before(c.createNextAllowedAt) {
+		return nil, c.createNextAllowedAt.Sub(now), lastErr
+	}
+	if c.createProbeInflight {
+		return nil, 250 * time.Millisecond, lastErr
+	}
+	c.createProbeInflight = true
+	return func() {
+		c.createFailureLock.Lock()
+		c.createProbeInflight = false
+		c.createFailureLock.Unlock()
+	}, 0, lastErr
+}
+
+func (c *Client) finishCreateAttempt(err error) {
+	c.createFailureLock.Lock()
+	defer c.createFailureLock.Unlock()
+
+	if err == nil {
+		c.createFailureCount = 0
+		c.createNextAllowedAt = time.Time{}
+		c.createLastErr = nil
+		return
+	}
+
+	c.createFailureCount++
+	c.createLastErr = err
+	cooldown := backoffDuration(c.createFailureCount)
+	c.createNextAllowedAt = time.Now().Add(cooldown)
+}
+
+func backoffDuration(failureCount int) time.Duration {
+	if failureCount <= 0 {
+		return 0
+	}
+	backoff := 300 * time.Millisecond
+	for i := 1; i < failureCount; i++ {
+		backoff *= 2
+		if backoff >= 8*time.Second {
+			return 8 * time.Second
+		}
+	}
+	if backoff > 8*time.Second {
+		return 8 * time.Second
+	}
+	return backoff
+}
+
 func (c *Client) getIdleSession() (idle *Session) {
 	c.idleSessionLock.Lock()
 	if !c.idleSession.IsEmpty() {
@@ -142,7 +236,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 
-	session := NewClientSession(underlying, &padding.DefaultPaddingFactory)
+	session := NewClientSession(underlying, &padding.DefaultPaddingFactory, c.settings)
 	session.seq = c.sessionCounter.Add(1)
 	session.dieHook = func() {
 		if clientDebugSessionPool {

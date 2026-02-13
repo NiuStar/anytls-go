@@ -45,22 +45,25 @@ type Session struct {
 	peerVersion byte
 
 	// client
-	isClient    bool
-	sendPadding bool
-	buffering   bool
-	buffer      []byte
-	pktCounter  atomic.Uint32
+	clientSettings util.StringMap
+	settingsLock   sync.RWMutex
+	isClient       bool
+	sendPadding    bool
+	buffering      bool
+	buffer         []byte
+	pktCounter     atomic.Uint32
 
 	// server
 	onNewStream func(stream *Stream)
 }
 
-func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory]) *Session {
+func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], clientSettings util.StringMap) *Session {
 	s := &Session{
-		conn:        conn,
-		isClient:    true,
-		sendPadding: true,
-		padding:     _padding,
+		conn:           conn,
+		isClient:       true,
+		sendPadding:    true,
+		padding:        _padding,
+		clientSettings: clientSettings,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -89,12 +92,34 @@ func (s *Session) Run() {
 		"client":      util.ProgramVersionName,
 		"padding-md5": s.padding.Load().Md5,
 	}
+	for k, v := range s.clientSettings {
+		if k != "" && v != "" {
+			settings[k] = v
+		}
+	}
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
 	s.buffering = true
 	s.writeControlFrame(f)
 
 	go s.recvLoop()
+}
+
+func (s *Session) setClientSettings(settings util.StringMap) {
+	copied := make(util.StringMap, len(settings))
+	for k, v := range settings {
+		copied[k] = v
+	}
+
+	s.settingsLock.Lock()
+	s.clientSettings = copied
+	s.settingsLock.Unlock()
+}
+
+func (s *Session) ClientSetting(key string) string {
+	s.settingsLock.RLock()
+	defer s.settingsLock.RUnlock()
+	return s.clientSettings[key]
 }
 
 // IsClosed does a safe check to see if we have shutdown
@@ -275,6 +300,7 @@ func (s *Session) recvLoop() error {
 					if !s.isClient {
 						receivedSettingsFromClient = true
 						m := util.StringMapFromBytes(buffer)
+						s.setClientSettings(m)
 						paddingF := s.padding.Load()
 						if m["padding-md5"] != paddingF.Md5 {
 							// logrus.Debugln("remote md5 is", m["padding-md5"])
@@ -375,20 +401,35 @@ func (s *Session) streamClosed(sid uint32) error {
 }
 
 func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
-	dataLen := len(data)
-
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(cmdPSH)
-	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(data)
-	_, err := s.writeConn(buffer.Bytes())
-	buffer.Release()
-	if err != nil {
-		return 0, err
+	const maxFramePayload = int(^uint16(0))
+	if len(data) == 0 {
+		return 0, nil
 	}
 
-	return dataLen, nil
+	total := 0
+	for len(data) > 0 {
+		chunkLen := len(data)
+		if chunkLen > maxFramePayload {
+			chunkLen = maxFramePayload
+		}
+		chunk := data[:chunkLen]
+
+		buffer := buf.NewSize(chunkLen + headerOverHeadSize)
+		buffer.WriteByte(cmdPSH)
+		binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+		binary.BigEndian.PutUint16(buffer.Extend(2), uint16(chunkLen))
+		buffer.Write(chunk)
+		_, err := s.writeConn(buffer.Bytes())
+		buffer.Release()
+		if err != nil {
+			return total, err
+		}
+
+		total += chunkLen
+		data = data[chunkLen:]
+	}
+
+	return total, nil
 }
 
 func (s *Session) writeControlFrame(frame frame) (int, error) {

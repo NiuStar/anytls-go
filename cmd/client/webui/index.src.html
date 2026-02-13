@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AnyTLS Client Web</title>
+  <link rel="stylesheet" href="https://unpkg.com/antd@5/dist/reset.css" />
+  <style>
+    body { margin: 0; background: #f5f7fb; }
+    #root { min-height: 100vh; }
+    .page { padding: 20px; max-width: 1320px; margin: 0 auto; }
+    .card { margin-bottom: 16px; }
+    .result-ok { color: #1677ff; }
+    .result-err { color: #ff4d4f; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/antd@5/dist/antd.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const {useEffect, useMemo, useState} = React;
+const {
+  Layout, Typography, Card, Space, Button, Table, Tag, Form, Input, InputNumber, Switch,
+  Modal, Tabs, message, Popconfirm, Alert, Divider
+} = antd;
+
+async function api(path, options) {
+  const res = await fetch(path, {
+    headers: {"Content-Type": "application/json"},
+    ...options
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
+function App() {
+  const [loading, setLoading] = useState(false);
+  const [statusLoading, setStatusLoading] = useState(false);
+  const [configPath, setConfigPath] = useState("");
+  const [config, setConfig] = useState(null);
+  const [current, setCurrent] = useState("");
+  const [runtimeStatus, setRuntimeStatus] = useState(null);
+  const [selected, setSelected] = useState([]);
+  const [savingConfig, setSavingConfig] = useState(false);
+  const [tunApplying, setTunApplying] = useState(false);
+  const [savingNode, setSavingNode] = useState(false);
+  const [resultVisible, setResultVisible] = useState(false);
+  const [resultTitle, setResultTitle] = useState("");
+  const [resultRows, setResultRows] = useState([]);
+  const [diagnoseVisible, setDiagnoseVisible] = useState(false);
+  const [diagnoseRows, setDiagnoseRows] = useState([]);
+  const [diagnoseSummary, setDiagnoseSummary] = useState(null);
+  const [diagnoseRaw, setDiagnoseRaw] = useState(null);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [backupVisible, setBackupVisible] = useState(false);
+  const [backupRows, setBackupRows] = useState([]);
+  const [backupLoading, setBackupLoading] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
+  const [editNodeName, setEditNodeName] = useState("");
+  const [editVisible, setEditVisible] = useState(false);
+
+  const [configForm] = Form.useForm();
+  const [importForm] = Form.useForm();
+  const [manualForm] = Form.useForm();
+  const [editForm] = Form.useForm();
+  const [probeForm] = Form.useForm();
+
+  const nodes = useMemo(() => (config?.nodes || []), [config]);
+
+  async function refreshAll() {
+    setLoading(true);
+    try {
+      const data = await api("/api/v1/config");
+      setConfigPath(data.config_path || "");
+      setConfig(data.config || null);
+      setCurrent(data.current || "");
+      if (data.config) {
+        configForm.setFieldsValue({
+          listen: data.config.listen,
+          control: data.config.control,
+          web_username: data.config.web_username || "",
+          web_password: data.config.web_password || "",
+          min_idle_session: data.config.min_idle_session,
+          default_node: data.config.default_node,
+          tun_enabled: !!data.config.tun?.enabled,
+          tun_name: data.config.tun?.name || "anytls0",
+          tun_mtu: data.config.tun?.mtu || 1500,
+          tun_address: data.config.tun?.address || "198.18.0.1/15",
+          tun_auto_route: !!data.config.tun?.auto_route,
+          failover_enabled: !!data.config.failover?.enabled,
+          failover_check_interval_sec: data.config.failover?.check_interval_sec || 15,
+          failover_failure_threshold: data.config.failover?.failure_threshold || 2,
+          failover_probe_target: data.config.failover?.probe_target || "1.1.1.1:443",
+          failover_probe_timeout_ms: data.config.failover?.probe_timeout_ms || 2500,
+          failover_best_latency_enabled: !!data.config.failover?.best_latency_enabled,
+        });
+      }
+      await refreshStatus();
+    } catch (err) {
+      message.error(`加载失败: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshStatus() {
+    setStatusLoading(true);
+    try {
+      const data = await api("/api/v1/status");
+      setRuntimeStatus(data || null);
+    } catch (_) {
+      setRuntimeStatus(null);
+    } finally {
+      setStatusLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshAll();
+    const timer = setInterval(() => { refreshStatus(); }, 15000);
+    return () => clearInterval(timer);
+  }, []);
+
+  async function saveConfig() {
+    const values = await configForm.validateFields();
+    setSavingConfig(true);
+    try {
+      const payload = {
+        listen: values.listen,
+        control: values.control,
+        web_username: values.web_username || "",
+        web_password: values.web_password || "",
+        min_idle_session: values.min_idle_session,
+        default_node: values.default_node,
+        tun: {
+          enabled: !!values.tun_enabled,
+          name: values.tun_name,
+          mtu: values.tun_mtu,
+          address: values.tun_address,
+          auto_route: !!values.tun_auto_route,
+        },
+        failover: {
+          enabled: !!values.failover_enabled,
+          check_interval_sec: values.failover_check_interval_sec || 15,
+          failure_threshold: values.failover_failure_threshold || 2,
+          probe_target: values.failover_probe_target || "1.1.1.1:443",
+          probe_timeout_ms: values.failover_probe_timeout_ms || 2500,
+          best_latency_enabled: !!values.failover_best_latency_enabled,
+        }
+      };
+      const res = await api("/api/v1/config", {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      });
+      setConfig(res.config || config);
+      setCurrent(res.current || current);
+      message.success(res.restart_required ? "配置已保存（部分变更需重启 API 才生效）" : "配置已保存");
+    } catch (err) {
+      message.error(`保存失败: ${err.message}`);
+    } finally {
+      setSavingConfig(false);
+    }
+  }
+
+  async function applyTunToggle(enabled) {
+    setTunApplying(true);
+    try {
+      const values = configForm.getFieldsValue();
+      const res = await api("/api/v1/config", {
+        method: "PUT",
+        body: JSON.stringify({
+          tun: {
+            enabled: !!enabled,
+            name: values.tun_name || "anytls0",
+            mtu: values.tun_mtu || 1500,
+            address: values.tun_address || "198.18.0.1/15",
+            auto_route: !!values.tun_auto_route,
+          }
+        })
+      });
+      setConfig(res.config || config);
+      setCurrent(res.current || current);
+      message.success(enabled ? "TUN 已开启，开始接管全局流量" : "TUN 已关闭，已恢复普通网络");
+      await refreshAll();
+    } catch (err) {
+      message.error(`TUN 切换失败: ${err.message}`);
+      await refreshAll();
+    } finally {
+      setTunApplying(false);
+    }
+  }
+
+  async function importNode() {
+    const values = await importForm.validateFields();
+    setSavingNode(true);
+    try {
+      await api("/api/v1/nodes/import", {
+        method: "POST",
+        body: JSON.stringify({
+          name: values.name || "",
+          uri: values.uri
+        })
+      });
+      importForm.resetFields();
+      message.success("导入成功");
+      await refreshAll();
+    } catch (err) {
+      message.error(`导入失败: ${err.message}`);
+    } finally {
+      setSavingNode(false);
+    }
+  }
+
+  async function createNode() {
+    const values = await manualForm.validateFields();
+    setSavingNode(true);
+    try {
+      await api("/api/v1/nodes", {
+        method: "POST",
+        body: JSON.stringify({
+          name: values.name,
+          server: values.server,
+          password: values.password,
+          sni: values.sni || "",
+          egress_ip: values.egress_ip || "",
+          egress_rule: values.egress_rule || ""
+        })
+      });
+      manualForm.resetFields();
+      message.success("新增成功");
+      await refreshAll();
+    } catch (err) {
+      message.error(`新增失败: ${err.message}`);
+    } finally {
+      setSavingNode(false);
+    }
+  }
+
+  async function switchNode(name) {
+    try {
+      await api("/api/v1/switch", {
+        method: "POST",
+        body: JSON.stringify({name})
+      });
+      message.success(`已切换到 ${name}`);
+      await refreshAll();
+    } catch (err) {
+      message.error(`切换失败: ${err.message}`);
+    }
+  }
+
+  async function deleteNode(name) {
+    try {
+      await api(`/api/v1/nodes/${encodeURIComponent(name)}`, {method: "DELETE"});
+      message.success(`已删除 ${name}`);
+      await refreshAll();
+    } catch (err) {
+      message.error(`删除失败: ${err.message}`);
+    }
+  }
+
+  function openEdit(node) {
+    setEditNodeName(node.name);
+    editForm.setFieldsValue({
+      server: node.server,
+      password: node.password,
+      sni: node.sni || "",
+      egress_ip: node.egress_ip || "",
+      egress_rule: node.egress_rule || ""
+    });
+    setEditVisible(true);
+  }
+
+  async function saveNodeEdit() {
+    const values = await editForm.validateFields();
+    try {
+      await api(`/api/v1/nodes/${encodeURIComponent(editNodeName)}`, {
+        method: "PUT",
+        body: JSON.stringify(values)
+      });
+      setEditVisible(false);
+      message.success("修改成功");
+      await refreshAll();
+    } catch (err) {
+      message.error(`修改失败: ${err.message}`);
+    }
+  }
+
+  async function runLatency(names) {
+    const pv = probeForm.getFieldsValue();
+    try {
+      const res = await api("/api/v1/test/latency", {
+        method: "POST",
+        body: JSON.stringify({
+          names,
+          target: pv.latency_target || "",
+          count: pv.latency_count || 3,
+          timeout_ms: pv.timeout_ms || 6000
+        })
+      });
+      setResultTitle("延迟测试结果");
+      setResultRows((res.results || []).map((x, i) => ({
+        key: `${x.name}-${i}`,
+        name: x.name,
+        value: x.avg_ms ? `${x.avg_ms.toFixed(2)} ms` : "-",
+        detail: `成功 ${x.success}/${x.count}` + (x.error ? `, 错误: ${x.error}` : "")
+      })));
+      setResultVisible(true);
+    } catch (err) {
+      message.error(`延迟测试失败: ${err.message}`);
+    }
+  }
+
+  async function runBandwidth(names) {
+    const pv = probeForm.getFieldsValue();
+    try {
+      const res = await api("/api/v1/test/bandwidth", {
+        method: "POST",
+        body: JSON.stringify({
+          names,
+          url: pv.bandwidth_url || "",
+          max_bytes: pv.max_bytes || 5242880,
+          timeout_ms: pv.timeout_ms || 20000
+        })
+      });
+      setResultTitle("带宽测试结果");
+      setResultRows((res.results || []).map((x, i) => ({
+        key: `${x.name}-${i}`,
+        name: x.name,
+        value: x.mbps ? `${x.mbps.toFixed(2)} Mbps` : "-",
+        detail: x.error ? `错误: ${x.error}` : `流量 ${x.bytes} bytes, 耗时 ${x.duration_ms} ms`
+      })));
+      setResultVisible(true);
+    } catch (err) {
+      message.error(`带宽测试失败: ${err.message}`);
+    }
+  }
+
+  async function runDiagnose() {
+    setDiagnosing(true);
+    try {
+      const res = await api("/api/v1/diagnose");
+      const checks = (res.checks || []).map((x, i) => ({
+        key: `${x.name}-${i}`,
+        name: x.name,
+        ok: !!x.ok,
+        detail: x.detail || "",
+        latency: x.latency_ms || 0,
+        error: x.error || ""
+      }));
+      setDiagnoseRows(checks);
+      setDiagnoseSummary(res.summary || null);
+      setDiagnoseRaw(res || null);
+      setDiagnoseVisible(true);
+    } catch (err) {
+      message.error(`诊断失败: ${err.message}`);
+    } finally {
+      setDiagnosing(false);
+    }
+  }
+
+  function downloadReport(filename, content, mimeType) {
+    const blob = new Blob([content], {type: mimeType || "text/plain;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function exportDiagnoseJSON() {
+    if (!diagnoseRaw) {
+      message.warning("暂无诊断数据");
+      return;
+    }
+    const stamp = new Date().toISOString().replaceAll(":", "-");
+    downloadReport(`anytls-diagnose-${stamp}.json`, JSON.stringify(diagnoseRaw, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportDiagnoseText() {
+    if (!diagnoseRaw) {
+      message.warning("暂无诊断数据");
+      return;
+    }
+    const lines = [];
+    lines.push("AnyTLS Client Diagnose Report");
+    lines.push(`Time: ${diagnoseRaw.time || "-"}`);
+    lines.push(`Current: ${diagnoseRaw.current || "-"}`);
+    lines.push(`Summary: ok=${diagnoseSummary?.ok ? "true" : "false"}, failed=${diagnoseSummary?.failed || 0}, total=${diagnoseSummary?.total || 0}`);
+    lines.push("");
+    (diagnoseRaw.checks || []).forEach((c) => {
+      const latency = c.latency_ms ? ` latency=${c.latency_ms}ms` : "";
+      const detail = c.detail ? ` detail=${c.detail}` : "";
+      const err = c.error ? ` error=${c.error}` : "";
+      lines.push(`- ${c.name}: ${c.ok ? "OK" : "FAIL"}${latency}${detail}${err}`);
+    });
+    lines.push("");
+    const stamp = new Date().toISOString().replaceAll(":", "-");
+    downloadReport(`anytls-diagnose-${stamp}.txt`, lines.join("\\n"), "text/plain;charset=utf-8");
+  }
+
+  async function loadBackups() {
+    setBackupLoading(true);
+    try {
+      const res = await api("/api/v1/config/backups");
+      const rows = (res.backups || []).map((x) => ({
+        key: x.name,
+        name: x.name,
+        size: x.size || 0,
+        mod_time: x.mod_time || "",
+      }));
+      setBackupRows(rows);
+      setBackupVisible(true);
+    } catch (err) {
+      message.error(`加载备份失败: ${err.message}`);
+    } finally {
+      setBackupLoading(false);
+    }
+  }
+
+  async function rollbackBackup(name) {
+    setRollingBack(true);
+    try {
+      const res = await api("/api/v1/config/rollback", {
+        method: "POST",
+        body: JSON.stringify({backup: name || ""})
+      });
+      message.success(res.message || "回滚成功，请重启 API 完整生效");
+      await refreshAll();
+      await loadBackups();
+    } catch (err) {
+      message.error(`回滚失败: ${err.message}`);
+    } finally {
+      setRollingBack(false);
+    }
+  }
+
+  const nodeColumns = [
+    {title: "名称", dataIndex: "name"},
+    {title: "服务器", dataIndex: "server"},
+    {title: "SNI", dataIndex: "sni", render: (v) => v || "-"},
+    {
+      title: "状态",
+      dataIndex: "name",
+      render: (name) => name === current ? <Tag color="blue">当前</Tag> : <Tag>待机</Tag>
+    },
+    {
+      title: "操作",
+      dataIndex: "name",
+      render: (_, record) => (
+        <Space wrap>
+          <Button size="small" onClick={() => switchNode(record.name)}>切换</Button>
+          <Button size="small" onClick={() => openEdit(record)}>修改</Button>
+          <Button size="small" onClick={() => runLatency([record.name])}>测延迟</Button>
+          <Button size="small" onClick={() => runBandwidth([record.name])}>测带宽</Button>
+          <Popconfirm title={`删除 ${record.name} ?`} onConfirm={() => deleteNode(record.name)}>
+            <Button danger size="small">删除</Button>
+          </Popconfirm>
+        </Space>
+      )
+    }
+  ];
+
+  return (
+    <Layout>
+      <div className="page">
+        <Typography.Title level={3} style={{marginTop: 0}}>AnyTLS Client 管理面板</Typography.Title>
+        <Space direction="vertical" style={{display: "flex"}}>
+          <Alert type="info" showIcon message={`配置文件: ${configPath || "-"}`} />
+
+          <Card className="card" title="运行状态" extra={<Button size="small" onClick={refreshStatus} loading={statusLoading}>刷新状态</Button>}>
+            <Space wrap>
+              <Tag color="blue">节点: {runtimeStatus?.current || "-"}</Tag>
+              <Tag color={runtimeStatus?.tun?.running ? "processing" : "default"}>TUN: {runtimeStatus?.tun?.running ? "运行中" : "未运行"}</Tag>
+              <Tag color={runtimeStatus?.failover?.enabled ? "blue" : "default"}>故障切换: {runtimeStatus?.failover?.enabled ? "开启" : "关闭"}</Tag>
+              <Tag>监听: {runtimeStatus?.active_listen || "-"}</Tag>
+              <Tag>API: {runtimeStatus?.active_control || "-"}</Tag>
+              <Tag>运行时长: {runtimeStatus?.uptime_sec || 0}s</Tag>
+              <Tag>版本: {runtimeStatus?.version || "-"}</Tag>
+            </Space>
+            {runtimeStatus?.health?.ok === false ? (
+              <Alert
+                style={{marginTop: 12}}
+                type="error"
+                showIcon
+                message="运行状态异常"
+                description={(runtimeStatus.health.issues || []).join("; ")}
+              />
+            ) : null}
+          </Card>
+
+          <Card className="card" title="基础配置" extra={<Space><Button onClick={refreshAll} loading={loading}>刷新</Button><Button onClick={runDiagnose} loading={diagnosing}>一键诊断</Button><Button onClick={loadBackups} loading={backupLoading}>配置备份</Button></Space>}>
+            <Form layout="vertical" form={configForm}>
+              <Space style={{display: "flex"}} align="start" wrap>
+                <Form.Item label="本地代理监听" name="listen" rules={[{required: true}]}>
+                  <Input style={{width: 220}} />
+                </Form.Item>
+                <Form.Item label="API 监听地址" name="control" rules={[{required: true}]}>
+                  <Input style={{width: 220}} />
+                </Form.Item>
+                <Form.Item label="Web 用户名" name="web_username">
+                  <Input style={{width: 180}} />
+                </Form.Item>
+                <Form.Item label="Web 密码" name="web_password">
+                  <Input.Password style={{width: 180}} />
+                </Form.Item>
+                <Form.Item label="最小空闲会话" name="min_idle_session" rules={[{required: true}]}>
+                  <InputNumber style={{width: 140}} min={1} />
+                </Form.Item>
+                <Form.Item label="默认节点" name="default_node" rules={[{required: true}]}>
+                  <Input style={{width: 200}} />
+                </Form.Item>
+              </Space>
+
+              <Divider orientation="left">TUN</Divider>
+              <Space style={{display: "flex"}} align="start" wrap>
+                <Form.Item label="启用 TUN" name="tun_enabled" valuePropName="checked">
+                  <Switch loading={tunApplying} onChange={(checked) => applyTunToggle(checked)} />
+                </Form.Item>
+                <Form.Item label="设备名" name="tun_name"><Input style={{width: 160}} /></Form.Item>
+                <Form.Item label="MTU" name="tun_mtu"><InputNumber style={{width: 120}} min={1200} max={9000} /></Form.Item>
+                <Form.Item label="地址网段" name="tun_address"><Input style={{width: 220}} /></Form.Item>
+                <Form.Item label="自动路由" name="tun_auto_route" valuePropName="checked"><Switch /></Form.Item>
+              </Space>
+              <Typography.Text type="secondary">TUN 开关会立即生效：开启后接管全局流量，关闭后恢复普通网络。</Typography.Text>
+
+              <Divider orientation="left">Failover</Divider>
+              <Space style={{display: "flex"}} align="start" wrap>
+                <Form.Item label="启用自动故障切换" name="failover_enabled" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+                <Form.Item label="探测间隔(秒)" name="failover_check_interval_sec">
+                  <InputNumber style={{width: 160}} min={3} max={300} />
+                </Form.Item>
+                <Form.Item label="连续失败阈值" name="failover_failure_threshold">
+                  <InputNumber style={{width: 160}} min={1} max={10} />
+                </Form.Item>
+                <Form.Item label="探测目标" name="failover_probe_target">
+                  <Input style={{width: 220}} placeholder="1.1.1.1:443" />
+                </Form.Item>
+                <Form.Item label="探测超时(ms)" name="failover_probe_timeout_ms">
+                  <InputNumber style={{width: 180}} min={300} max={30000} />
+                </Form.Item>
+                <Form.Item label="故障时切到最低延迟节点" name="failover_best_latency_enabled" valuePropName="checked">
+                  <Switch />
+                </Form.Item>
+              </Space>
+              <Button type="primary" loading={savingConfig} onClick={saveConfig}>保存配置</Button>
+            </Form>
+          </Card>
+
+          <Card className="card" title="新增节点">
+            <Tabs
+              items={[
+                {
+                  key: "import",
+                  label: "URI 一键导入",
+                  children: (
+                    <Form form={importForm} layout="inline">
+                      <Form.Item name="uri" label="URI" rules={[{required: true}]}>
+                        <Input style={{width: 520}} placeholder="anytls://..." />
+                      </Form.Item>
+                      <Form.Item name="name" label="节点名">
+                        <Input style={{width: 180}} placeholder="可留空自动生成" />
+                      </Form.Item>
+                      <Form.Item>
+                        <Button type="primary" loading={savingNode} onClick={importNode}>导入</Button>
+                      </Form.Item>
+                    </Form>
+                  )
+                },
+                {
+                  key: "manual",
+                  label: "按属性新增",
+                  children: (
+                    <Form form={manualForm} layout="inline">
+                      <Form.Item name="name" label="节点名" rules={[{required: true}]}>
+                        <Input style={{width: 150}} />
+                      </Form.Item>
+                      <Form.Item name="server" label="服务器" rules={[{required: true}]}>
+                        <Input style={{width: 200}} placeholder="host:port" />
+                      </Form.Item>
+                      <Form.Item name="password" label="密码" rules={[{required: true}]}>
+                        <Input style={{width: 180}} />
+                      </Form.Item>
+                      <Form.Item name="sni" label="SNI"><Input style={{width: 150}} /></Form.Item>
+                      <Form.Item name="egress_ip" label="egress-ip"><Input style={{width: 150}} /></Form.Item>
+                      <Form.Item name="egress_rule" label="egress-rule"><Input style={{width: 220}} /></Form.Item>
+                      <Form.Item>
+                        <Button type="primary" loading={savingNode} onClick={createNode}>新增</Button>
+                      </Form.Item>
+                    </Form>
+                  )
+                }
+              ]}
+            />
+          </Card>
+
+          <Card className="card" title="节点列表">
+            <Form form={probeForm} layout="inline" initialValues={{
+              latency_target: "1.1.1.1:443",
+              latency_count: 3,
+              timeout_ms: 6000,
+              bandwidth_url: "https://speed.cloudflare.com/__down?bytes=5000000",
+              max_bytes: 5242880
+            }}>
+              <Form.Item name="latency_target" label="延迟目标"><Input style={{width: 180}} /></Form.Item>
+              <Form.Item name="latency_count" label="次数"><InputNumber min={1} max={10} /></Form.Item>
+              <Form.Item name="timeout_ms" label="超时(ms)"><InputNumber min={1000} max={60000} /></Form.Item>
+              <Form.Item name="bandwidth_url" label="测速 URL"><Input style={{width: 360}} /></Form.Item>
+              <Form.Item name="max_bytes" label="测速字节"><InputNumber min={262144} max={209715200} /></Form.Item>
+            </Form>
+            <Divider />
+            <Space style={{marginBottom: 12}} wrap>
+              <Button onClick={() => runLatency(nodes.map(n => n.name))}>全量测延迟</Button>
+              <Button onClick={() => runBandwidth(nodes.map(n => n.name))}>全量测带宽</Button>
+              <Button disabled={selected.length === 0} onClick={() => runLatency(selected)}>批量测延迟</Button>
+              <Button disabled={selected.length === 0} onClick={() => runBandwidth(selected)}>批量测带宽</Button>
+            </Space>
+
+            <Table
+              rowKey="name"
+              loading={loading}
+              dataSource={nodes}
+              columns={nodeColumns}
+              pagination={false}
+              rowSelection={{
+                selectedRowKeys: selected,
+                onChange: (keys) => setSelected(keys)
+              }}
+            />
+          </Card>
+        </Space>
+      </div>
+
+      <Modal title={`编辑节点: ${editNodeName}`} open={editVisible} onCancel={() => setEditVisible(false)} onOk={saveNodeEdit}>
+        <Form layout="vertical" form={editForm}>
+          <Form.Item label="服务器" name="server"><Input /></Form.Item>
+          <Form.Item label="密码" name="password"><Input /></Form.Item>
+          <Form.Item label="SNI" name="sni"><Input /></Form.Item>
+          <Form.Item label="egress-ip" name="egress_ip"><Input /></Form.Item>
+          <Form.Item label="egress-rule" name="egress_rule"><Input /></Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal title={resultTitle} open={resultVisible} onCancel={() => setResultVisible(false)} footer={null} width={840}>
+        <Table
+          rowKey="key"
+          dataSource={resultRows}
+          pagination={false}
+          columns={[
+            {title: "节点", dataIndex: "name"},
+            {title: "结果", dataIndex: "value"},
+            {title: "详情", dataIndex: "detail"}
+          ]}
+        />
+      </Modal>
+
+      <Modal title="一键诊断结果" open={diagnoseVisible} onCancel={() => setDiagnoseVisible(false)} footer={null} width={900}>
+        <Space style={{marginBottom: 12}} wrap>
+          <Button onClick={exportDiagnoseJSON}>导出 JSON</Button>
+          <Button onClick={exportDiagnoseText}>导出文本</Button>
+        </Space>
+        {diagnoseSummary ? (
+          <Alert
+            style={{marginBottom: 12}}
+            type={diagnoseSummary.ok ? "success" : "warning"}
+            showIcon
+            message={diagnoseSummary.ok ? "诊断通过" : `发现 ${diagnoseSummary.failed} 项异常`}
+          />
+        ) : null}
+        <Table
+          rowKey="key"
+          dataSource={diagnoseRows}
+          pagination={false}
+          columns={[
+            {title: "检查项", dataIndex: "name"},
+            {title: "状态", dataIndex: "ok", render: (v) => v ? <Tag color="blue">OK</Tag> : <Tag color="red">FAIL</Tag>},
+            {title: "延迟", dataIndex: "latency", render: (v) => v > 0 ? `${v} ms` : "-"},
+            {title: "详情", dataIndex: "detail", render: (v) => v || "-"},
+            {title: "错误", dataIndex: "error", render: (v) => v || "-"}
+          ]}
+        />
+      </Modal>
+
+      <Modal title="配置备份与回滚" open={backupVisible} onCancel={() => setBackupVisible(false)} footer={null} width={960}>
+        <Space style={{marginBottom: 12}} wrap>
+          <Button onClick={loadBackups} loading={backupLoading}>刷新备份</Button>
+          <Popconfirm title="确认回滚到最近一次备份？" onConfirm={() => rollbackBackup("")}>
+            <Button danger loading={rollingBack}>回滚到最近备份</Button>
+          </Popconfirm>
+        </Space>
+        <Table
+          rowKey="key"
+          loading={backupLoading}
+          dataSource={backupRows}
+          pagination={false}
+          columns={[
+            {title: "备份名", dataIndex: "name"},
+            {title: "大小", dataIndex: "size", render: (v) => `${v} bytes`},
+            {title: "时间", dataIndex: "mod_time"},
+            {
+              title: "操作",
+              dataIndex: "name",
+              render: (name) => (
+                <Popconfirm title={`确认回滚到 ${name} ?`} onConfirm={() => rollbackBackup(name)}>
+                  <Button danger size="small" loading={rollingBack}>回滚</Button>
+                </Popconfirm>
+              )
+            }
+          ]}
+        />
+      </Modal>
+    </Layout>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
