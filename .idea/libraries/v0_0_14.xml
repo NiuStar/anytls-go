@@ -1,0 +1,12 @@
+<component name="libraryTable">
+  <library name="v0.0.14">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14/anytls-client_0.0.14_windows_amd64.zip!/" />
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14/anytls-server_0.0.14_windows_amd64.zip!/" />
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14/anytls-server_0.0.14_windows_arm64.zip!/" />
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14/anytls-client_0.0.14_windows_arm64.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>

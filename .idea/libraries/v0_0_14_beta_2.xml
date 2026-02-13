@@ -1,0 +1,10 @@
+<component name="libraryTable">
+  <library name="v0.0.14-beta.2">
+    <CLASSES>
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14-beta.2/anytls_0.0.14-beta.2_windows_amd64.zip!/" />
+      <root url="jar://$PROJECT_DIR$/dist/releases/v0.0.14-beta.2/anytls_0.0.14-beta.2_windows_arm64.zip!/" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+  </library>
+</component>
