@@ -60,14 +60,18 @@ func runServerMenu() error {
 				fmt.Println()
 				continue
 			}
-			if err := validateCertDir(cfg.CertDir); err != nil {
-				fmt.Println("配置 cert-dir 无效:", err)
+			if err := validateServerTLSConfig(cfg); err != nil {
+				fmt.Println("配置 TLS 参数无效:", err)
 				fmt.Println()
 				continue
 			}
 			args := []string{"-l", cfg.Listen, "-p", cfg.Password}
 			if cfg.CertDir != "" {
 				args = append(args, "--cert-dir", cfg.CertDir)
+			} else if cfg.CertFile != "" && cfg.KeyFile != "" {
+				args = append(args, "--cert-file", cfg.CertFile, "--key-file", cfg.KeyFile)
+			} else if cfg.CACertFile != "" && cfg.CAKeyFile != "" {
+				args = append(args, "--ca-cert", cfg.CACertFile, "--ca-key", cfg.CAKeyFile)
 			}
 			fmt.Printf("正在启动服务: %s\n", cfg.Listen)
 			runServer(args)

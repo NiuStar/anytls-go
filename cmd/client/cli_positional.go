@@ -86,7 +86,7 @@ func runPositionalCLI(args []string) error {
 			return err
 		}
 	}
-	return runCLI(effectiveConfigPath, controlAddr, opts.cmd, opts.nodeName, opts.nodeURI, opts.backupName, clientNodeConfig{})
+	return runCLI(effectiveConfigPath, controlAddr, opts.cmd, opts.nodeName, opts.nodeURI, opts.backupName, clientNodeConfig{}, cliNodeUpdateOptions{})
 }
 
 func parsePositionalCLIOptions(args []string) (positionalCLIOptions, error) {

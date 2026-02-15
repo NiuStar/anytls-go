@@ -35,6 +35,8 @@ type tunRuntime struct {
 	routeNodeServer     string
 	routeMaintainCancel context.CancelFunc
 	routeBypassTargets  map[string]struct{}
+	darwinDNSManaged    bool
+	darwinDNSSnapshot   map[string][]string
 }
 
 type tunStepLogger struct {
@@ -105,7 +107,7 @@ func startTunRuntime(ctx context.Context, cfg clientTunConfig, socksListen strin
 	if !cfg.Enabled {
 		return nil, nil
 	}
-	steps := newTunStepLogger(7, tunStartProgressCallbackFromContext(ctx))
+	steps := newTunStepLogger(8, tunStartProgressCallbackFromContext(ctx))
 
 	done := steps.begin("预处理配置")
 	cfg.Name = normalizeTunDeviceNameForOS(runtime.GOOS, cfg.Name)
@@ -195,6 +197,21 @@ func startTunRuntime(ctx context.Context, cfg clientTunConfig, socksListen strin
 			logrus.Infof("[Client] disabled macOS system proxy settings (%d operations)", changed)
 		}
 		done()
+		if cfg.AutoRoute {
+			done = steps.begin("接管 macOS 系统 DNS")
+			snapshot, changed, err := enforceDarwinSystemDNS(defaultDarwinManagedDNSServers())
+			if err != nil {
+				logrus.Warnln("[Client] enforce macOS system DNS failed:", err)
+			}
+			if len(snapshot) > 0 {
+				t.darwinDNSSnapshot = snapshot
+				t.darwinDNSManaged = true
+			}
+			if changed > 0 {
+				logrus.Infof("[Client] enforced macOS DNS servers on %d service(s)", changed)
+			}
+			done()
+		}
 		if cfg.DisableOtherProxies {
 			done = steps.begin("关闭其他代理进程")
 			killed, err := stopKnownDarwinProxyProcesses(os.Getpid())
@@ -221,6 +238,9 @@ func startTunRuntime(ctx context.Context, cfg clientTunConfig, socksListen strin
 			t.routeNodeServer = selectedNode.Server
 			done()
 		}
+		done = steps.begin("刷新 macOS DNS 缓存")
+		flushDarwinDNSCache()
+		done()
 	} else if cfg.AutoRoute {
 		t.Close()
 		return nil, fmt.Errorf("tun auto_route is not supported on %s", runtime.GOOS)
@@ -318,6 +338,19 @@ func (t *tunRuntime) Close() error {
 		t.routeNodeServer = ""
 		t.routeBypassTargets = make(map[string]struct{})
 	}
+	if runtime.GOOS == "darwin" && t.darwinDNSManaged {
+		if restored, err := restoreDarwinSystemDNS(t.darwinDNSSnapshot); err != nil {
+			logrus.Warnln("[Client] restore macOS DNS servers failed:", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		} else if restored > 0 {
+			logrus.Infof("[Client] restored macOS DNS servers on %d service(s)", restored)
+		}
+		flushDarwinDNSCache()
+		t.darwinDNSManaged = false
+		t.darwinDNSSnapshot = nil
+	}
 
 	// Close netstack and device in a non-blocking-safe order:
 	// device close first helps unblock packet loops before waiting netstack shutdown.
@@ -374,6 +407,9 @@ func (t *tunRuntime) OnSwitch(node clientNodeConfig) error {
 	}
 	if failed := t.reapplyBypassTargetsLocked(t.route); len(failed) > 0 {
 		logrus.Warnf("[Client] tun bypass replay after switch failed: %d target(s): %s", len(failed), strings.Join(failed, ", "))
+	}
+	if runtime.GOOS == "darwin" {
+		flushDarwinDNSCache()
 	}
 	return nil
 }
@@ -911,6 +947,12 @@ func newDarwinRouteManager(tunName string) (*darwinRouteManager, error) {
 		bypass6: make(map[string]struct{}),
 	}
 	if err := m.refreshDefaultRoute(); err != nil {
+		// Allow manager creation when default route is temporarily on utun.
+		// ActivateForNode will try to recover physical uplink using server route.
+		if strings.Contains(err.Error(), "default route currently points to") {
+			logrus.Warnf("[Client] darwin route manager init with transient utun default route: %v", err)
+			return m, nil
+		}
 		return nil, err
 	}
 	return m, nil
@@ -918,13 +960,27 @@ func newDarwinRouteManager(tunName string) (*darwinRouteManager, error) {
 
 func (m *darwinRouteManager) ActivateForNode(server string) error {
 	if err := m.refreshDefaultRoute(); err != nil {
-		return err
+		// If default already points to another utun (for example stale previous TUN),
+		// try to recover physical uplink from current server host route before failing.
+		if recoverErr := m.recoverDefaultRouteFromServer(server); recoverErr != nil {
+			return err
+		}
+		logrus.Warnf("[Client] darwin route manager recovered uplink from server route: %s via %s", strings.TrimSpace(m.defaultIf), strings.TrimSpace(m.defaultGateway))
 	}
 	if err := m.UpdateNode(server); err != nil {
 		return err
 	}
-	if err := m.replaceSplitDefaultRoutes(); err != nil {
-		return err
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := m.replaceSplitDefaultRoutes(); err != nil {
+			return err
+		}
+		if err := m.verifySplitDefaultRoutes(); err == nil {
+			m.cleanupStaleDNSBypassRoutes(server)
+			return nil
+		} else if attempt == 1 {
+			return err
+		}
+		time.Sleep(120 * time.Millisecond)
 	}
 	return nil
 }
@@ -947,6 +1003,12 @@ func (m *darwinRouteManager) refreshDefaultRoute() error {
 	if strings.HasPrefix(strings.ToLower(iface), "utun") {
 		// Never overwrite cached physical uplink with utun route.
 		if m.hasUsableCachedIPv4Uplink() {
+			return nil
+		}
+		// Fallback: try to discover a physical default route from route table snapshot.
+		if gw, ifc, detectErr := detectDarwinPhysicalDefaultRoute(); detectErr == nil && strings.TrimSpace(ifc) != "" {
+			m.defaultGateway = strings.TrimSpace(gw)
+			m.defaultIf = strings.TrimSpace(ifc)
 			return nil
 		}
 		if iface == m.tunName {
@@ -978,6 +1040,30 @@ func (m *darwinRouteManager) refreshDefaultRoute() error {
 	return nil
 }
 
+func detectDarwinPhysicalDefaultRoute() (gateway, iface string, err error) {
+	out, err := runCommand("netstat", "-rn", "-f", "inet")
+	if err != nil {
+		return "", "", fmt.Errorf("netstat default route probe failed: %w", err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 4 {
+			continue
+		}
+		dst := fields[0]
+		if dst != "default" && dst != "0.0.0.0" {
+			continue
+		}
+		dev := strings.TrimSpace(fields[len(fields)-1])
+		if dev == "" || strings.HasPrefix(strings.ToLower(dev), "utun") {
+			continue
+		}
+		gw := strings.TrimSpace(fields[1])
+		return gw, dev, nil
+	}
+	return "", "", fmt.Errorf("no physical default route found in netstat output")
+}
+
 func (m *darwinRouteManager) replaceSplitDefaultRoutes() error {
 	_, _ = runCommand("route", "-n", "delete", "-net", "0.0.0.0/1")
 	_, _ = runCommand("route", "-n", "delete", "-net", "128.0.0.0/1")
@@ -1004,7 +1090,130 @@ func (m *darwinRouteManager) replaceSplitDefaultRoutes() error {
 	return nil
 }
 
+func (m *darwinRouteManager) verifySplitDefaultRoutes() error {
+	if m == nil {
+		return fmt.Errorf("nil darwin route manager")
+	}
+	tunName := strings.TrimSpace(strings.ToLower(m.tunName))
+	if tunName == "" {
+		return fmt.Errorf("empty darwin tun name")
+	}
+	probeTargets := []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"9.9.9.9",
+		"151.101.1.69",
+	}
+	var errs []string
+	for _, target := range probeTargets {
+		out, err := runCommand("route", "-n", "get", target)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("%s: %v", target, err))
+			continue
+		}
+		_, iface := parseDarwinRouteGetOutput(out)
+		iface = strings.TrimSpace(strings.ToLower(iface))
+		if iface == tunName {
+			return nil
+		}
+		if iface == "" {
+			errs = append(errs, fmt.Sprintf("%s: empty interface", target))
+			continue
+		}
+		if strings.HasPrefix(iface, "utun") {
+			errs = append(errs, fmt.Sprintf("%s: routed via other utun (%s)", target, iface))
+			continue
+		}
+		errs = append(errs, fmt.Sprintf("%s: routed via physical iface (%s)", target, iface))
+	}
+	if len(errs) == 0 {
+		return fmt.Errorf("split default route verify failed: no probe target")
+	}
+	return fmt.Errorf("split default route verify failed: %s", strings.Join(errs, " | "))
+}
+
+func (m *darwinRouteManager) cleanupStaleDNSBypassRoutes(server string) {
+	if m == nil {
+		return
+	}
+	candidates := append([]string(nil),
+		defaultDarwinManagedDNSServers()...,
+	)
+	legacy := []string{
+		"223.5.5.5",
+		"119.29.29.29",
+		"1.1.1.1",
+		"8.8.8.8",
+		"9.9.9.9",
+		"208.67.222.222",
+	}
+	candidates = append(candidates, legacy...)
+	candidates = append(candidates, discoverSystemDNSServers()...)
+
+	exclude := make(map[string]struct{}, 4)
+	if target4, target6, err := resolveServerIPSets(server); err == nil {
+		for ip := range target4 {
+			exclude[ip] = struct{}{}
+		}
+		for ip := range target6 {
+			exclude[ip] = struct{}{}
+		}
+	}
+
+	deleted := 0
+	seen := make(map[string]struct{}, len(candidates))
+	for _, item := range candidates {
+		host := strings.TrimSpace(item)
+		if host == "" {
+			continue
+		}
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = strings.TrimSpace(strings.Trim(h, "[]"))
+		} else {
+			host = strings.TrimSpace(strings.Trim(host, "[]"))
+		}
+		if host == "" {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			continue
+		}
+		host = ip.String()
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		if _, skip := exclude[host]; skip {
+			continue
+		}
+		if _, err := runCommand("route", "-n", "delete", "-host", host); err == nil {
+			deleted++
+		} else if !isRouteNotFoundError(err) {
+			logrus.Debugf("[Client] cleanup stale dns bypass (ipv4) failed: %s: %v", host, err)
+		}
+		if ip.To4() == nil {
+			if _, err := runCommand("route", "-n", "delete", "-inet6", "-host", host); err == nil {
+				deleted++
+			} else if !isRouteNotFoundError(err) {
+				logrus.Debugf("[Client] cleanup stale dns bypass (ipv6) failed: %s: %v", host, err)
+			}
+		}
+	}
+	if deleted > 0 {
+		logrus.Infof("[Client] cleaned %d stale macOS DNS bypass route(s)", deleted)
+	}
+}
+
 func (m *darwinRouteManager) UpdateNode(server string) error {
+	if err := m.refreshDefaultRoute(); err != nil {
+		// Keep runtime resilient when default route is temporarily utun-like.
+		// Recover physical uplink through server route when possible.
+		if recoverErr := m.recoverDefaultRouteFromServer(server); recoverErr != nil {
+			return err
+		}
+	}
+
 	target4, target6, err := resolveServerIPSets(server)
 	if err != nil {
 		return err
@@ -1040,6 +1249,52 @@ func (m *darwinRouteManager) UpdateNode(server string) error {
 			_, _ = runCommand("route", "-n", "delete", "-inet6", "-host", ip)
 			delete(m.bypass6, ip)
 		}
+	}
+	return nil
+}
+
+func (m *darwinRouteManager) recoverDefaultRouteFromServer(server string) error {
+	if m == nil {
+		return fmt.Errorf("nil darwin route manager")
+	}
+	target4, target6, err := resolveServerIPSets(server)
+	if err != nil {
+		return err
+	}
+
+	// Prefer IPv4 physical uplink because bypass host routes are managed on IPv4.
+	for ip := range target4 {
+		out, routeErr := runCommand("route", "-n", "get", ip)
+		if routeErr != nil {
+			continue
+		}
+		gateway, iface := parseDarwinRouteGetOutput(out)
+		iface = strings.TrimSpace(iface)
+		if iface == "" || strings.HasPrefix(strings.ToLower(iface), "utun") {
+			continue
+		}
+		m.defaultGateway = strings.TrimSpace(gateway)
+		m.defaultIf = iface
+		break
+	}
+	if !m.hasUsableCachedIPv4Uplink() {
+		return fmt.Errorf("cannot recover physical uplink from server route for %s", server)
+	}
+
+	// IPv6 uplink is optional; best effort.
+	for ip := range target6 {
+		out, routeErr := runCommand("route", "-n", "get", "-inet6", ip)
+		if routeErr != nil {
+			continue
+		}
+		gateway6, iface6 := parseDarwinRouteGetOutput(out)
+		iface6 = strings.TrimSpace(iface6)
+		if iface6 == "" || strings.HasPrefix(strings.ToLower(iface6), "utun") {
+			continue
+		}
+		m.defaultGateway6 = strings.TrimSpace(gateway6)
+		m.defaultIf6 = iface6
+		break
 	}
 	return nil
 }
@@ -1789,6 +2044,158 @@ func parseDarwinNetworkServices(output string) []string {
 	return services
 }
 
+func defaultDarwinManagedDNSServers() []string {
+	return []string{
+		"1.1.1.1",
+		"8.8.8.8",
+		"9.9.9.9",
+		"208.67.222.222",
+	}
+}
+
+func normalizeDarwinDNSServers(servers []string) []string {
+	out := make([]string, 0, len(servers))
+	seen := make(map[string]struct{}, len(servers))
+	for _, raw := range servers {
+		text := strings.TrimSpace(strings.Trim(raw, "[]"))
+		if text == "" {
+			continue
+		}
+		key := strings.ToLower(text)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, text)
+	}
+	return out
+}
+
+func equalDarwinDNSServers(a, b []string) bool {
+	left := normalizeDarwinDNSServers(a)
+	right := normalizeDarwinDNSServers(b)
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if strings.ToLower(left[i]) != strings.ToLower(right[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func getDarwinServiceDNSServers(service string) ([]string, error) {
+	service = strings.TrimSpace(service)
+	if service == "" {
+		return nil, fmt.Errorf("empty network service")
+	}
+	output, err := runCommand("networksetup", "-getdnsservers", service)
+	if err != nil {
+		return nil, err
+	}
+	lower := strings.ToLower(strings.TrimSpace(output))
+	if strings.Contains(lower, "there aren't any dns servers set on") ||
+		strings.Contains(lower, "there are no dns servers set on") {
+		return []string{}, nil
+	}
+	lines := strings.Split(output, "\n")
+	servers := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.EqualFold(line, "empty") {
+			return []string{}, nil
+		}
+		servers = append(servers, line)
+	}
+	return normalizeDarwinDNSServers(servers), nil
+}
+
+func setDarwinServiceDNSServers(service string, servers []string) error {
+	service = strings.TrimSpace(service)
+	if service == "" {
+		return fmt.Errorf("empty network service")
+	}
+	servers = normalizeDarwinDNSServers(servers)
+	args := []string{"-setdnsservers", service}
+	if len(servers) == 0 {
+		args = append(args, "Empty")
+	} else {
+		args = append(args, servers...)
+	}
+	_, err := runCommand("networksetup", args...)
+	return err
+}
+
+func enforceDarwinSystemDNS(targetServers []string) (map[string][]string, int, error) {
+	targetServers = normalizeDarwinDNSServers(targetServers)
+	output, err := runCommand("networksetup", "-listallnetworkservices")
+	if err != nil {
+		return nil, 0, err
+	}
+	services := parseDarwinNetworkServices(output)
+	if len(services) == 0 {
+		return nil, 0, nil
+	}
+	snapshot := make(map[string][]string, len(services))
+	changed := 0
+	errs := make([]string, 0)
+	for _, service := range services {
+		current, getErr := getDarwinServiceDNSServers(service)
+		if getErr != nil {
+			errs = append(errs, fmt.Sprintf("%s(get): %v", service, getErr))
+			continue
+		}
+		snapshot[service] = append([]string(nil), current...)
+		if equalDarwinDNSServers(current, targetServers) {
+			continue
+		}
+		if setErr := setDarwinServiceDNSServers(service, targetServers); setErr != nil {
+			errs = append(errs, fmt.Sprintf("%s(set): %v", service, setErr))
+			continue
+		}
+		changed++
+	}
+	if len(errs) > 0 {
+		return snapshot, changed, errors.New(strings.Join(errs, "; "))
+	}
+	return snapshot, changed, nil
+}
+
+func restoreDarwinSystemDNS(snapshot map[string][]string) (int, error) {
+	if len(snapshot) == 0 {
+		return 0, nil
+	}
+	changed := 0
+	errs := make([]string, 0)
+	for service, desired := range snapshot {
+		service = strings.TrimSpace(service)
+		if service == "" {
+			continue
+		}
+		current, getErr := getDarwinServiceDNSServers(service)
+		if getErr != nil {
+			errs = append(errs, fmt.Sprintf("%s(get): %v", service, getErr))
+			continue
+		}
+		if equalDarwinDNSServers(current, desired) {
+			continue
+		}
+		if setErr := setDarwinServiceDNSServers(service, desired); setErr != nil {
+			errs = append(errs, fmt.Sprintf("%s(restore): %v", service, setErr))
+			continue
+		}
+		changed++
+	}
+	if len(errs) > 0 {
+		return changed, errors.New(strings.Join(errs, "; "))
+	}
+	return changed, nil
+}
+
 func stopKnownDarwinProxyProcesses(excludePID int) (int, error) {
 	patterns := []string{
 		"[/]Applications/Surge.app/Contents/MacOS/Surge",
@@ -1848,6 +2255,32 @@ func stopKnownDarwinProxyProcesses(excludePID int) (int, error) {
 		return killed, errors.New(strings.Join(errs, "; "))
 	}
 	return killed, nil
+}
+
+func flushDarwinDNSCache() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	ran := false
+	if _, err := runCommand("dscacheutil", "-flushcache"); err != nil {
+		logrus.Warnln("[Client] flush macOS dscache failed:", err)
+	} else {
+		ran = true
+	}
+	if _, err := runCommand("killall", "-HUP", "mDNSResponder"); err != nil {
+		logrus.Warnln("[Client] reload mDNSResponder failed:", err)
+	} else {
+		ran = true
+	}
+	if _, err := runCommand("killall", "-HUP", "mDNSResponderHelper"); err != nil {
+		// mDNSResponderHelper is optional on some macOS versions.
+		logrus.Debugln("[Client] reload mDNSResponderHelper skipped:", err)
+	} else {
+		ran = true
+	}
+	if ran {
+		logrus.Infoln("[Client] macOS DNS cache refreshed")
+	}
 }
 
 func findPIDsByPattern(pattern string) ([]int, error) {

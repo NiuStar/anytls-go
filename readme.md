@@ -44,6 +44,107 @@ v0.0.12 版本起，示例客户端可直接使用 URI 格式:
 ./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port"
 ```
 
+更安全的客户端 TLS 配置（推荐）：
+
+```bash
+# 方式1：命令行
+./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port?sni=example.com&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt"
+
+# 方式2：节点字段（API/WebUI/client.json）
+# allow_insecure=false + ca_cert_path=/etc/anytls/ca.crt
+```
+
+在其他 Go 仓库里复用 AnyTLS URI（含 `insecure`/`ca-cert-path`）：
+
+```go
+import "anytls/proxy/anytlsuri"
+
+node, err := anytlsuri.Parse("anytls://password@host:443?sni=example.com&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt")
+if err != nil {
+    panic(err)
+}
+
+out, err := anytlsuri.Build(anytlsuri.Node{
+    Server:        node.Server,
+    Password:      node.Password,
+    SNI:           node.SNI,
+    AllowInsecure: node.AllowInsecure,
+    CACertPath:    node.CACertPath,
+})
+if err != nil {
+    panic(err)
+}
+_ = out
+```
+
+在其他 Go 仓库里复用客户端 TLS 证书策略（`allow_insecure` + `ca_cert_path`）：
+
+```go
+import "anytls/proxy/tlsopts"
+
+cfg, err := tlsopts.BuildClientConfig(tlsopts.ClientOptions{
+    Server:        "example.com:443",
+    SNI:           "example.com",
+    AllowInsecure: false,
+    CACertPath:    "/etc/anytls/ca.crt",
+})
+if err != nil {
+    panic(err)
+}
+_ = cfg
+```
+
+在其他 Go 仓库里复用“节点 TLS 字段模型 + 默认策略”：
+
+```go
+import "anytls/proxy/nodeopts"
+
+tlsNode := nodeopts.NormalizeTLS(nodeopts.TLS{
+    AllowInsecure: nil, // 未设置
+    CACertPath:    " /etc/anytls/ca.crt ",
+})
+if err := nodeopts.ValidateTLS(tlsNode); err != nil {
+    panic(err)
+}
+
+// 兼容旧行为：未设置时默认 true
+allowInsecure := nodeopts.EffectiveAllowInsecure(tlsNode.AllowInsecure, true)
+_ = allowInsecure
+```
+
+在其他 Go 仓库里复用“节点更新语义（设置/清空/default）”：
+
+```go
+import "anytls/proxy/nodeopts"
+
+payload, err := nodeopts.BuildCLIUpdatePayload(
+    nodeopts.NodeData{SNI: "example.com"},
+    "",
+    nodeopts.NodeClearOptions{ClearCACertPath: true},
+)
+if err != nil {
+    panic(err)
+}
+_ = payload
+```
+
+在其他 Go 仓库里复用服务端 TLS 模式（`auto` / `cert-dir` / `cert-file+key-file` / `ca-cert+ca-key`）：
+
+```go
+import "anytls/proxy/tlsopts"
+
+cfg, mode, err := tlsopts.BuildServerConfig(tlsopts.ServerOptions{
+    Listen:     "0.0.0.0:8443",
+    CACertFile: "/etc/anytls/ca.crt",
+    CAKeyFile:  "/etc/anytls/ca.key",
+})
+if err != nil {
+    panic(err)
+}
+_ = cfg
+_ = mode // "ca-cert+ca-key"
+```
+
 ### 查看版本与构建信息
 
 客户端：
@@ -108,7 +209,27 @@ Shadowrocket 2.2.65+ 实现了 anytls 协议的客户端。
 - `sni` 可选
 - `egress_ip` 可选
 - `egress_rule` 可选（按目标地址匹配服务端出口 IP，命中优先）
+- `allow_insecure` 可选（默认 `true`；建议设为 `false`）
+- `ca_cert_path` 可选（当 `allow_insecure=false` 时可指定自定义 CA 证书）
 - `tun` 可选（启用后在 `api` 模式下启用 TUN 透明接管）
+
+节点 JSON 示例（可直接用于其他仓库生成 `client.json`）：
+
+```json
+{
+  "name": "node-main",
+  "server": "example.com:8443",
+  "password": "your-password",
+  "sni": "example.com",
+  "allow_insecure": false,
+  "ca_cert_path": "/etc/anytls/ca.crt",
+  "egress_ip": "",
+  "egress_rule": "",
+  "groups": [
+    "default"
+  ]
+}
+```
 
 运行：
 
@@ -461,6 +582,13 @@ anytls-client -mode cli -config ~/.config/anytls/client.json -control 127.0.0.1:
 
 ```bash
 anytls-client -mode cli -config ~/.config/anytls/client.json -control 127.0.0.1:18990 -cmd update -node node-2 -egress-ip 203.0.113.10
+
+# 更新 TLS 校验为“严格 + 指定 CA”
+anytls-client -mode cli -config ~/.config/anytls/client.json -control 127.0.0.1:18990 -cmd update -node node-2 -allow-insecure false -ca-cert-path /etc/anytls/ca.crt
+
+# 显式清空字段（避免只能覆盖不能清空）
+anytls-client -mode cli -config ~/.config/anytls/client.json -control 127.0.0.1:18990 -cmd update -node node-2 --clear-ca-cert-path --clear-allow-insecure
+anytls-client -mode cli -config ~/.config/anytls/client.json -control 127.0.0.1:18990 -cmd update -node node-2 --clear-sni --clear-egress-ip --clear-egress-rule
 ```
 
 删除节点（delete）：
@@ -594,4 +722,33 @@ anytls-server config export
 ```bash
 anytls-server config edit --config /etc/anytls/server.env --listen 0.0.0.0:20086 --password 'your-password' --auto-cert --yes
 anytls-server config export --config /etc/anytls/server.env --addr example.com:20086 --node-prefix hk --egress-ip 203.0.113.10 --yes
+```
+
+导出节点时可附带客户端 TLS 字段（便于跨仓库直接引用）：
+
+```bash
+anytls-server config export --config /etc/anytls/server.env \
+  --addr example.com:20086 --node-prefix hk \
+  --allow-insecure false --ca-cert-path /etc/anytls/ca.crt --yes
+```
+
+服务端 TLS 证书模式（四选一）：
+
+- 自动证书（默认）：不设置证书参数
+- 目录证书：`--cert-dir /path/to/certdir`（目录内需 `server.crt` 与 `server.key`）
+- 显式证书：`--cert-file /path/server.crt --key-file /path/server.key`
+- CA 签发模式：`--ca-cert /path/ca.crt --ca-key /path/ca.key`（服务端按 SNI 动态签发叶子证书）
+
+示例：
+
+```bash
+# 显式证书
+anytls-server config edit --config /etc/anytls/server.env \
+  --listen 0.0.0.0:20086 --password 'your-password' \
+  --cert-file /etc/anytls/server.crt --key-file /etc/anytls/server.key --yes
+
+# CA 签发
+anytls-server config edit --config /etc/anytls/server.env \
+  --listen 0.0.0.0:20086 --password 'your-password' \
+  --ca-cert /etc/anytls/ca.crt --ca-key /etc/anytls/ca.key --yes
 ```

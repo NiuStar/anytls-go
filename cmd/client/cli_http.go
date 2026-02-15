@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/proxy/nodeopts"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -13,7 +14,15 @@ import (
 	"time"
 )
 
-func runCLI(configPath, controlAddr, cmd, nodeName, nodeURI, backupName string, nodeData clientNodeConfig) error {
+type cliNodeUpdateOptions struct {
+	ClearSNI           bool
+	ClearEgressIP      bool
+	ClearEgressRule    bool
+	ClearCACertPath    bool
+	ClearAllowInsecure bool
+}
+
+func runCLI(configPath, controlAddr, cmd, nodeName, nodeURI, backupName string, nodeData clientNodeConfig, updateOpts cliNodeUpdateOptions) error {
 	command := strings.ToLower(strings.TrimSpace(cmd))
 	if command == "" {
 		return fmt.Errorf("cli mode requires -cmd")
@@ -67,7 +76,14 @@ func runCLI(configPath, controlAddr, cmd, nodeName, nodeURI, backupName string, 
 		if nodeName == "" {
 			return fmt.Errorf("%s requires -node", command)
 		}
-		return cliRequest(client, http.MethodPut, apiURL(addr, "/api/v1/nodes/"+url.PathEscape(nodeName)), nodeDataWithURI(nodeData, nodeURI), authUser, authPass)
+		payload, err := buildNodeUpdatePayload(nodeData, nodeURI, updateOpts)
+		if err != nil {
+			return err
+		}
+		if len(payload) == 0 {
+			return fmt.Errorf("%s requires at least one update field (for example -uri/-s/-p/-sni/-egress-ip/-egress-rule/-allow-insecure/-ca-cert-path/--clear-...)", command)
+		}
+		return cliRequest(client, http.MethodPut, apiURL(addr, "/api/v1/nodes/"+url.PathEscape(nodeName)), payload, authUser, authPass)
 	case "delete", "del", "rm":
 		nodeName = strings.TrimSpace(nodeName)
 		if nodeName == "" {
@@ -111,14 +127,36 @@ func resolveAPIAccess(configPath, controlAddr string) (addr, authUser, authPass 
 }
 
 func nodeDataWithURI(node clientNodeConfig, uri string) map[string]any {
-	return map[string]any{
-		"server":      node.Server,
-		"password":    node.Password,
-		"sni":         node.SNI,
-		"egress_ip":   node.EgressIP,
-		"egress_rule": node.EgressRule,
-		"uri":         uri,
-	}
+	payload, _ := nodeopts.BuildCLIUpdatePayload(nodeopts.NodeData{
+		Server:        node.Server,
+		Password:      node.Password,
+		SNI:           node.SNI,
+		EgressIP:      node.EgressIP,
+		EgressRule:    node.EgressRule,
+		AllowInsecure: node.AllowInsecure,
+		CACertPath:    node.CACertPath,
+		Groups:        node.Groups,
+	}, uri, nodeopts.NodeClearOptions{})
+	return payload
+}
+
+func buildNodeUpdatePayload(node clientNodeConfig, uri string, opts cliNodeUpdateOptions) (map[string]any, error) {
+	return nodeopts.BuildCLIUpdatePayload(nodeopts.NodeData{
+		Server:        node.Server,
+		Password:      node.Password,
+		SNI:           node.SNI,
+		EgressIP:      node.EgressIP,
+		EgressRule:    node.EgressRule,
+		AllowInsecure: node.AllowInsecure,
+		CACertPath:    node.CACertPath,
+		Groups:        node.Groups,
+	}, uri, nodeopts.NodeClearOptions{
+		ClearSNI:           opts.ClearSNI,
+		ClearEgressIP:      opts.ClearEgressIP,
+		ClearEgressRule:    opts.ClearEgressRule,
+		ClearCACertPath:    opts.ClearCACertPath,
+		ClearAllowInsecure: opts.ClearAllowInsecure,
+	})
 }
 
 func cliRequest(httpClient *http.Client, method, url string, payload any, authUser, authPass string) error {

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sirupsen/logrus"
 )
 
 type routingMatchRequest struct {
@@ -201,7 +202,18 @@ func (s *apiState) handleRoutingEgressProbe(w http.ResponseWriter, r *http.Reque
 			err = clientErr
 			break
 		}
-		conn, err = client.CreateProxy(ctx, destination)
+		proxyDestination := destination
+		if node, ok := s.manager.Node(strings.TrimSpace(decision.action.node)); ok {
+			hostHints := []string{strings.TrimSpace(parsedURL.Hostname())}
+			rewritten, resolveErr := resolveDestinationForNodeEgressFamily(node, destination, hostHints, dnsMap)
+			if resolveErr != nil {
+				err = resolveErr
+				break
+			}
+			proxyDestination = rewritten
+		}
+		result["proxy_destination"] = proxyDestination.String()
+		conn, err = client.CreateProxy(ctx, proxyDestination)
 	default:
 		err = fmt.Errorf("unsupported route action: %d", decision.action.kind)
 	}
@@ -298,6 +310,35 @@ func (s *apiState) handleRoutingHitsClear(w http.ResponseWriter, r *http.Request
 	store.clear()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"cleared": true,
+	})
+}
+
+func (s *apiState) handleRoutingDNSMapClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	s.lock.Lock()
+	dnsMap := s.dnsMap
+	s.lock.Unlock()
+	if dnsMap == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"cleared":                true,
+			"removed_ip_count":       0,
+			"removed_mappings":       0,
+			"removed_blocked_domain": 0,
+			"removed_blocked_ip":     0,
+		})
+		return
+	}
+	ipCount, mappingCount, blockedDomainCount, blockedIPCount := dnsMap.Clear()
+	logrus.Warnf("[Client] routing dns-map cleared: ips=%d mappings=%d blocked_domains=%d blocked_ips=%d", ipCount, mappingCount, blockedDomainCount, blockedIPCount)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"cleared":                true,
+		"removed_ip_count":       ipCount,
+		"removed_mappings":       mappingCount,
+		"removed_blocked_domain": blockedDomainCount,
+		"removed_blocked_ip":     blockedIPCount,
 	})
 }
 

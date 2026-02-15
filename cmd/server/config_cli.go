@@ -1,6 +1,9 @@
 package main
 
 import (
+	"anytls/proxy/anytlsuri"
+	"anytls/proxy/nodeopts"
+	"anytls/proxy/tlsopts"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -22,24 +25,32 @@ import (
 const defaultServerListen = "0.0.0.0:8443"
 
 type serverEnvConfig struct {
-	Listen   string
-	Password string
-	CertDir  string
+	Listen     string
+	Password   string
+	CertDir    string
+	CertFile   string
+	KeyFile    string
+	CACertFile string
+	CAKeyFile  string
 }
 
 type exportedNode struct {
-	Name       string `json:"name"`
-	URI        string `json:"uri"`
-	EgressIP   string `json:"egress_ip,omitempty"`
-	EgressRule string `json:"egress_rule,omitempty"`
+	Name          string `json:"name"`
+	URI           string `json:"uri"`
+	EgressIP      string `json:"egress_ip,omitempty"`
+	EgressRule    string `json:"egress_rule,omitempty"`
+	AllowInsecure *bool  `json:"allow_insecure,omitempty"`
+	CACertPath    string `json:"ca_cert_path,omitempty"`
 }
 
 type serverExportPreset struct {
-	Addrs      []string `json:"addrs"`
-	NodePrefix string   `json:"node_prefix"`
-	SNI        string   `json:"sni,omitempty"`
-	EgressIP   string   `json:"egress_ip,omitempty"`
-	EgressRule string   `json:"egress_rule,omitempty"`
+	Addrs         []string `json:"addrs"`
+	NodePrefix    string   `json:"node_prefix"`
+	SNI           string   `json:"sni,omitempty"`
+	EgressIP      string   `json:"egress_ip,omitempty"`
+	EgressRule    string   `json:"egress_rule,omitempty"`
+	AllowInsecure *bool    `json:"allow_insecure,omitempty"`
+	CACertPath    string   `json:"ca_cert_path,omitempty"`
 }
 
 var stdinReader = bufio.NewReader(os.Stdin)
@@ -66,6 +77,10 @@ func runServerConfigEdit(args []string) error {
 	listen := fs.String("listen", "", "listen address host:port")
 	password := fs.String("password", "", "password")
 	certDir := fs.String("cert-dir", "", "TLS cert dir, requires server.crt and server.key")
+	certFile := fs.String("cert-file", "", "TLS cert file path")
+	keyFile := fs.String("key-file", "", "TLS key file path")
+	caCert := fs.String("ca-cert", "", "CA cert file path (used to issue server certs)")
+	caKey := fs.String("ca-key", "", "CA key file path (used to issue server certs)")
 	autoCert := fs.Bool("auto-cert", false, "clear cert-dir and use auto-generated cert")
 	yes := fs.Bool("yes", false, "non-interactive mode")
 	if err := fs.Parse(args); err != nil {
@@ -90,9 +105,31 @@ func runServerConfigEdit(args []string) error {
 	}
 	if strings.TrimSpace(*certDir) != "" {
 		cfg.CertDir = strings.TrimSpace(*certDir)
+		cfg.CertFile = ""
+		cfg.KeyFile = ""
+		cfg.CACertFile = ""
+		cfg.CAKeyFile = ""
+	}
+	if strings.TrimSpace(*certFile) != "" || strings.TrimSpace(*keyFile) != "" {
+		cfg.CertFile = strings.TrimSpace(*certFile)
+		cfg.KeyFile = strings.TrimSpace(*keyFile)
+		cfg.CertDir = ""
+		cfg.CACertFile = ""
+		cfg.CAKeyFile = ""
+	}
+	if strings.TrimSpace(*caCert) != "" || strings.TrimSpace(*caKey) != "" {
+		cfg.CACertFile = strings.TrimSpace(*caCert)
+		cfg.CAKeyFile = strings.TrimSpace(*caKey)
+		cfg.CertDir = ""
+		cfg.CertFile = ""
+		cfg.KeyFile = ""
 	}
 	if *autoCert {
 		cfg.CertDir = ""
+		cfg.CertFile = ""
+		cfg.KeyFile = ""
+		cfg.CACertFile = ""
+		cfg.CAKeyFile = ""
 	}
 
 	if !*yes {
@@ -148,7 +185,7 @@ func runServerConfigEdit(args []string) error {
 	if hasControlChars(cfg.Password) {
 		return fmt.Errorf("password contains control characters (for example newline/tab), please set a plain text password")
 	}
-	if err := validateCertDir(cfg.CertDir); err != nil {
+	if err := validateServerTLSConfig(cfg); err != nil {
 		return err
 	}
 	if err := saveServerEnvConfig(*configPath, cfg); err != nil {
@@ -157,9 +194,16 @@ func runServerConfigEdit(args []string) error {
 
 	fmt.Println("配置已写入:", *configPath)
 	fmt.Println("LISTEN:", cfg.Listen)
-	if cfg.CertDir != "" {
+	switch {
+	case cfg.CertDir != "":
 		fmt.Println("CERT_DIR:", cfg.CertDir)
-	} else {
+	case cfg.CertFile != "" || cfg.KeyFile != "":
+		fmt.Println("CERT_FILE:", cfg.CertFile)
+		fmt.Println("KEY_FILE:", cfg.KeyFile)
+	case cfg.CACertFile != "" || cfg.CAKeyFile != "":
+		fmt.Println("CA_CERT_FILE:", cfg.CACertFile)
+		fmt.Println("CA_KEY_FILE:", cfg.CAKeyFile)
+	default:
 		fmt.Println("CERT_DIR: (auto-generated)")
 	}
 	return nil
@@ -175,6 +219,8 @@ func runServerConfigExport(args []string) error {
 	sni := fs.String("sni", "", "sni")
 	egressIP := fs.String("egress-ip", "", "egress-ip")
 	egressRule := fs.String("egress-rule", "", "egress-rule")
+	allowInsecureRaw := fs.String("allow-insecure", "", "export node allow_insecure (true/false), empty means omitted")
+	caCertPath := fs.String("ca-cert-path", "", "export node ca_cert_path")
 	yes := fs.Bool("yes", false, "non-interactive mode")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -203,7 +249,14 @@ func runServerConfigExport(args []string) error {
 		strings.TrimSpace(*nodePrefix) != "" ||
 		strings.TrimSpace(*sni) != "" ||
 		strings.TrimSpace(*egressIP) != "" ||
-		strings.TrimSpace(*egressRule) != ""
+		strings.TrimSpace(*egressRule) != "" ||
+		strings.TrimSpace(*allowInsecureRaw) != "" ||
+		strings.TrimSpace(*caCertPath) != ""
+
+	allowInsecure, err := parseOptionalBool(*allowInsecureRaw)
+	if err != nil {
+		return err
+	}
 
 	useLast := false
 	reader := stdinReader
@@ -228,6 +281,17 @@ func runServerConfigExport(args []string) error {
 			}
 			if strings.TrimSpace(*egressRule) == "" {
 				*egressRule = strings.TrimSpace(preset.EgressRule)
+			}
+			if strings.TrimSpace(*allowInsecureRaw) == "" && preset.AllowInsecure != nil {
+				if *preset.AllowInsecure {
+					*allowInsecureRaw = "true"
+				} else {
+					*allowInsecureRaw = "false"
+				}
+				allowInsecure = nodeopts.CloneBoolPtr(preset.AllowInsecure)
+			}
+			if strings.TrimSpace(*caCertPath) == "" {
+				*caCertPath = strings.TrimSpace(preset.CACertPath)
 			}
 			fmt.Println("已选择：沿用上次导出配置。")
 		} else {
@@ -292,6 +356,7 @@ func runServerConfigExport(args []string) error {
 	*sni = strings.TrimSpace(*sni)
 	*egressIP = strings.TrimSpace(*egressIP)
 	*egressRule = strings.TrimSpace(*egressRule)
+	*caCertPath = strings.TrimSpace(*caCertPath)
 	if *nodePrefix == "" {
 		return fmt.Errorf("node-prefix is empty")
 	}
@@ -311,11 +376,13 @@ func runServerConfigExport(args []string) error {
 		}
 	}
 	if err := saveServerExportPreset(presetPath, &serverExportPreset{
-		Addrs:      append([]string{}, addrs...),
-		NodePrefix: *nodePrefix,
-		SNI:        *sni,
-		EgressIP:   *egressIP,
-		EgressRule: *egressRule,
+		Addrs:         append([]string{}, addrs...),
+		NodePrefix:    *nodePrefix,
+		SNI:           *sni,
+		EgressIP:      *egressIP,
+		EgressRule:    *egressRule,
+		AllowInsecure: nodeopts.CloneBoolPtr(allowInsecure),
+		CACertPath:    *caCertPath,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: save last export preset failed: %v\n", err)
 	}
@@ -326,11 +393,17 @@ func runServerConfigExport(args []string) error {
 		if len(addrs) > 1 {
 			name = fmt.Sprintf("%s-%d", *nodePrefix, i+1)
 		}
+		uri, uriErr := buildNodeURI(cfg.Password, addr, *sni, *egressIP, *egressRule, allowInsecure, *caCertPath)
+		if uriErr != nil {
+			return fmt.Errorf("build node uri failed for %s: %w", addr, uriErr)
+		}
 		nodes = append(nodes, exportedNode{
-			Name:       name,
-			URI:        buildNodeURI(cfg.Password, addr, *sni, *egressIP, *egressRule),
-			EgressIP:   *egressIP,
-			EgressRule: *egressRule,
+			Name:          name,
+			URI:           uri,
+			EgressIP:      *egressIP,
+			EgressRule:    *egressRule,
+			AllowInsecure: nodeopts.CloneBoolPtr(allowInsecure),
+			CACertPath:    *caCertPath,
 		})
 	}
 
@@ -375,6 +448,7 @@ func loadServerExportPreset(path string) (*serverExportPreset, error) {
 	preset.SNI = strings.TrimSpace(preset.SNI)
 	preset.EgressIP = strings.TrimSpace(preset.EgressIP)
 	preset.EgressRule = strings.TrimSpace(preset.EgressRule)
+	preset.CACertPath = strings.TrimSpace(preset.CACertPath)
 	for i := range preset.Addrs {
 		preset.Addrs[i] = strings.TrimSpace(preset.Addrs[i])
 	}
@@ -429,6 +503,14 @@ func loadServerEnvConfig(path string) (serverEnvConfig, error) {
 			cfg.Password = value
 		case "CERT_DIR":
 			cfg.CertDir = value
+		case "CERT_FILE":
+			cfg.CertFile = value
+		case "KEY_FILE":
+			cfg.KeyFile = value
+		case "CA_CERT_FILE":
+			cfg.CACertFile = value
+		case "CA_KEY_FILE":
+			cfg.CAKeyFile = value
 		}
 	}
 	return cfg, nil
@@ -576,6 +658,10 @@ func saveServerEnvConfig(path string, cfg serverEnvConfig) error {
 	fmt.Fprintf(&buf, "LISTEN=%q\n", cfg.Listen)
 	fmt.Fprintf(&buf, "PASSWORD=%q\n", cfg.Password)
 	fmt.Fprintf(&buf, "CERT_DIR=%q\n", cfg.CertDir)
+	fmt.Fprintf(&buf, "CERT_FILE=%q\n", cfg.CertFile)
+	fmt.Fprintf(&buf, "KEY_FILE=%q\n", cfg.KeyFile)
+	fmt.Fprintf(&buf, "CA_CERT_FILE=%q\n", cfg.CACertFile)
+	fmt.Fprintf(&buf, "CA_KEY_FILE=%q\n", cfg.CAKeyFile)
 	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("write config failed: %w", err)
 	}
@@ -626,6 +712,32 @@ func validateCertDir(certDir string) error {
 		return fmt.Errorf("missing cert file: %s", filepath.Join(certDir, "server.key"))
 	}
 	return nil
+}
+
+func validateFileExists(path string, label string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("invalid %s %q: %w", label, path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%s must be a file: %s", label, path)
+	}
+	return nil
+}
+
+func validateServerTLSConfig(cfg serverEnvConfig) error {
+	return tlsopts.ValidateServerOptions(tlsopts.ServerOptions{
+		Listen:     strings.TrimSpace(cfg.Listen),
+		CertDir:    strings.TrimSpace(cfg.CertDir),
+		CertFile:   strings.TrimSpace(cfg.CertFile),
+		KeyFile:    strings.TrimSpace(cfg.KeyFile),
+		CACertFile: strings.TrimSpace(cfg.CACertFile),
+		CAKeyFile:  strings.TrimSpace(cfg.CAKeyFile),
+	})
 }
 
 func validateEgressRule(ruleRaw string) error {
@@ -738,38 +850,25 @@ func isPublicIP(ipText string) bool {
 	return true
 }
 
-func buildNodeURI(password, addr, sni, egressIP, egressRule string) string {
-	var query []string
-	if sni != "" {
-		query = append(query, "sni="+uriEncode(sni))
-	}
-	if egressIP != "" {
-		query = append(query, "egress-ip="+uriEncode(egressIP))
-	}
-	if egressRule != "" {
-		query = append(query, "egress-rule="+uriEncode(egressRule))
-	}
-	uri := "anytls://" + uriEncode(password) + "@" + addr + "/"
-	if len(query) > 0 {
-		uri += "?" + strings.Join(query, "&")
-	}
-	return uri
+func buildNodeURI(password, addr, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string) (string, error) {
+	return anytlsuri.Build(anytlsuri.Node{
+		Server:        strings.TrimSpace(addr),
+		Password:      strings.TrimSpace(password),
+		SNI:           strings.TrimSpace(sni),
+		EgressIP:      strings.TrimSpace(egressIP),
+		EgressRule:    strings.TrimSpace(egressRule),
+		AllowInsecure: nodeopts.CloneBoolPtr(allowInsecure),
+		CACertPath:    strings.TrimSpace(caCertPath),
+	})
 }
 
-func uriEncode(raw string) string {
-	var b strings.Builder
-	for i := 0; i < len(raw); i++ {
-		c := raw[i]
-		if (c >= 'a' && c <= 'z') ||
-			(c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') ||
-			c == '.' || c == '~' || c == '_' || c == '-' {
-			b.WriteByte(c)
-			continue
-		}
-		b.WriteString(fmt.Sprintf("%%%02X", c))
+func parseOptionalBool(raw string) (*bool, error) {
+	raw = strings.TrimSpace(raw)
+	v, err := nodeopts.ParseOptionalBoolStrict(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid allow-insecure value %q, expect true/false", raw)
 	}
-	return b.String()
+	return v, nil
 }
 
 func promptInput(reader *bufio.Reader, label, defaultValue string) (string, error) {

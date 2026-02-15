@@ -1,6 +1,8 @@
 package main
 
 import (
+	"anytls/proxy/anytlsuri"
+	"anytls/proxy/nodeopts"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -37,15 +39,17 @@ type clientProfileConfig struct {
 }
 
 type clientNodeConfig struct {
-	Name       string   `json:"name"`
-	Server     string   `json:"server"`
-	Password   string   `json:"password"`
-	SNI        string   `json:"sni,omitempty"`
-	EgressIP   string   `json:"egress_ip,omitempty"`
-	EgressRule string   `json:"egress_rule,omitempty"`
-	Groups     []string `json:"groups,omitempty"`
-	SourceID   string   `json:"source_id,omitempty"`
-	URI        string   `json:"uri,omitempty"`
+	Name          string   `json:"name"`
+	Server        string   `json:"server"`
+	Password      string   `json:"password"`
+	SNI           string   `json:"sni,omitempty"`
+	EgressIP      string   `json:"egress_ip,omitempty"`
+	EgressRule    string   `json:"egress_rule,omitempty"`
+	AllowInsecure *bool    `json:"allow_insecure,omitempty"`
+	CACertPath    string   `json:"ca_cert_path,omitempty"`
+	Groups        []string `json:"groups,omitempty"`
+	SourceID      string   `json:"source_id,omitempty"`
+	URI           string   `json:"uri,omitempty"`
 }
 
 type clientSubscription struct {
@@ -59,12 +63,13 @@ type clientSubscription struct {
 }
 
 type clientRoutingConfig struct {
-	Enabled       bool                          `json:"enabled"`
-	Rules         []string                      `json:"rules,omitempty"`
-	RuleProviders map[string]clientRuleProvider `json:"rule_providers,omitempty"`
-	GeoIP         *clientRoutingGeoIPConfig     `json:"geoip,omitempty"`
-	GroupEgress   map[string]string             `json:"group_egress,omitempty"`
-	DefaultAction string                        `json:"default_action,omitempty"`
+	Enabled          bool                          `json:"enabled"`
+	Rules            []string                      `json:"rules,omitempty"`
+	RuleProviders    map[string]clientRuleProvider `json:"rule_providers,omitempty"`
+	GeoIP            *clientRoutingGeoIPConfig     `json:"geoip,omitempty"`
+	GroupEgress      map[string]string             `json:"group_egress,omitempty"`
+	DefaultAction    string                        `json:"default_action,omitempty"`
+	IPv6EgressStrict *bool                         `json:"ipv6_egress_strict,omitempty"`
 }
 
 type clientRuleProvider struct {
@@ -257,6 +262,10 @@ func normalizeAndValidateConfig(cfg *clientProfileConfig) error {
 func normalizeRoutingConfig(cfg *clientRoutingConfig) error {
 	cfg.Rules = normalizeRuleLines(cfg.Rules)
 	cfg.GroupEgress = normalizeRoutingGroupEgress(cfg.GroupEgress)
+	if cfg.IPv6EgressStrict == nil {
+		v := true
+		cfg.IPv6EgressStrict = &v
+	}
 	defaultAction, err := normalizeRoutingDefaultAction(cfg.DefaultAction)
 	if err != nil {
 		return err
@@ -284,6 +293,13 @@ func normalizeRoutingConfig(cfg *clientRoutingConfig) error {
 	}
 	cfg.RuleProviders = next
 	return nil
+}
+
+func routingIPv6EgressStrictEnabled(cfg *clientRoutingConfig) bool {
+	if cfg == nil || cfg.IPv6EgressStrict == nil {
+		return true
+	}
+	return *cfg.IPv6EgressStrict
 }
 
 func normalizeRoutingGeoIPConfig(cfg *clientRoutingGeoIPConfig) error {
@@ -642,9 +658,18 @@ func normalizeNode(node *clientNodeConfig) error {
 	node.SNI = strings.TrimSpace(node.SNI)
 	node.EgressIP = strings.TrimSpace(node.EgressIP)
 	node.EgressRule = strings.TrimSpace(node.EgressRule)
+	tlsFields := nodeopts.NormalizeTLS(nodeopts.TLS{
+		AllowInsecure: node.AllowInsecure,
+		CACertPath:    node.CACertPath,
+	})
+	node.AllowInsecure = cloneBoolPtr(tlsFields.AllowInsecure)
+	node.CACertPath = tlsFields.CACertPath
 	node.Groups = normalizeNodeGroups(node.Groups)
 	node.SourceID = strings.TrimSpace(node.SourceID)
 	node.URI = strings.TrimSpace(node.URI)
+	if err := nodeopts.ValidateTLS(tlsFields); err != nil {
+		return err
+	}
 
 	if node.Name == "" {
 		return fmt.Errorf("name is required")
@@ -652,7 +677,7 @@ func normalizeNode(node *clientNodeConfig) error {
 
 	if node.URI != "" {
 		if hasAnyTLSScheme(node.URI) {
-			server, password, sni, egressIP, egressRule, err := parseAnyTLSURI(node.URI)
+			server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseAnyTLSURIWithOptions(node.URI)
 			if err != nil {
 				return fmt.Errorf("invalid uri: %w", err)
 			}
@@ -674,6 +699,12 @@ func normalizeNode(node *clientNodeConfig) error {
 			}
 			if node.EgressRule == "" {
 				node.EgressRule = egressRule
+			}
+			if node.AllowInsecure == nil && allowInsecure != nil {
+				node.AllowInsecure = cloneBoolPtr(allowInsecure)
+			}
+			if node.CACertPath == "" {
+				node.CACertPath = caCertPath
 			}
 		} else if spec, ok, err := parseSOCKSBridgeNodeURI(node.URI); ok {
 			if err != nil {
@@ -805,33 +836,33 @@ func stableSubscriptionID(seed string) string {
 }
 
 func parseAnyTLSURI(raw string) (server, password, sni, egressIP, egressRule string, err error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", "", "", "", "", err
-	}
-	if u.Scheme != "anytls" {
-		return "", "", "", "", "", fmt.Errorf("scheme must be anytls")
-	}
-	server = u.Host
-	if u.User != nil {
-		// URI userinfo is percent-encoded on wire; store decoded password in config.
-		password = u.User.Username()
-	}
-	q := u.Query()
-	sni = q.Get("sni")
-	egressIP = q.Get("egress-ip")
-	egressRule = q.Get("egress-rule")
+	server, password, sni, egressIP, egressRule, _, _, err = parseAnyTLSURIWithOptions(raw)
 	return
 }
 
-func parseNodeURI(rawURI string) (server, password, sni, egressIP, egressRule string, err error) {
+func parseAnyTLSURIWithOptions(raw string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string, err error) {
+	parsed, err := anytlsuri.Parse(raw)
+	if err != nil {
+		return "", "", "", "", "", nil, "", err
+	}
+	server = parsed.Server
+	password = parsed.Password
+	sni = parsed.SNI
+	egressIP = parsed.EgressIP
+	egressRule = parsed.EgressRule
+	allowInsecure = cloneBoolPtr(parsed.AllowInsecure)
+	caCertPath = parsed.CACertPath
+	return
+}
+
+func parseNodeURI(rawURI string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string, err error) {
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" {
 		err = fmt.Errorf("uri is required")
 		return
 	}
 	if hasAnyTLSScheme(rawURI) {
-		return parseAnyTLSURI(rawURI)
+		return parseAnyTLSURIWithOptions(rawURI)
 	}
 	if spec, ok, parseErr := parseSOCKSBridgeNodeURI(rawURI); ok {
 		if parseErr != nil {
@@ -877,28 +908,15 @@ func buildAnyTLSURIFromNode(node clientNodeConfig) (string, error) {
 	if raw := strings.TrimSpace(node.URI); raw != "" && !hasAnyTLSScheme(raw) {
 		return raw, nil
 	}
-	server := strings.TrimSpace(node.Server)
-	password := strings.TrimSpace(node.Password)
-	if server == "" || password == "" {
-		return "", fmt.Errorf("server/password is required")
-	}
-	u := &url.URL{
-		Scheme: "anytls",
-		Host:   server,
-		User:   url.User(password),
-	}
-	q := url.Values{}
-	if sni := strings.TrimSpace(node.SNI); sni != "" {
-		q.Set("sni", sni)
-	}
-	if egressIP := strings.TrimSpace(node.EgressIP); egressIP != "" {
-		q.Set("egress-ip", egressIP)
-	}
-	if egressRule := strings.TrimSpace(node.EgressRule); egressRule != "" {
-		q.Set("egress-rule", egressRule)
-	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
+	return anytlsuri.Build(anytlsuri.Node{
+		Server:        strings.TrimSpace(node.Server),
+		Password:      strings.TrimSpace(node.Password),
+		SNI:           strings.TrimSpace(node.SNI),
+		EgressIP:      strings.TrimSpace(node.EgressIP),
+		EgressRule:    strings.TrimSpace(node.EgressRule),
+		AllowInsecure: cloneBoolPtr(node.AllowInsecure),
+		CACertPath:    strings.TrimSpace(node.CACertPath),
+	})
 }
 
 func decodePasswordCompat(raw string) (string, bool) {
@@ -916,6 +934,19 @@ func decodePasswordCompat(raw string) (string, bool) {
 	return decoded, true
 }
 
+func parseOptionalBoolString(raw string) *bool {
+	return nodeopts.ParseOptionalBoolLoose(raw)
+}
+
+func cloneBoolPtr(v *bool) *bool {
+	return nodeopts.CloneBoolPtr(v)
+}
+
+func nodeAllowInsecure(node clientNodeConfig) bool {
+	// Compatibility with historical behavior (always skip verify by default).
+	return nodeopts.EffectiveAllowInsecure(node.AllowInsecure, nodeopts.DefaultAllowInsecure)
+}
+
 func findNodeByName(nodes []clientNodeConfig, name string) (clientNodeConfig, bool) {
 	for _, n := range nodes {
 		if n.Name == name {
@@ -931,7 +962,7 @@ func upsertNodeFromURI(cfg *clientProfileConfig, nodeName, rawURI string) (strin
 		return "", fmt.Errorf("uri is required")
 	}
 
-	server, password, sni, egressIP, egressRule, err := parseNodeURI(rawURI)
+	server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseNodeURI(rawURI)
 	if err != nil {
 		return "", err
 	}
@@ -942,13 +973,15 @@ func upsertNodeFromURI(cfg *clientProfileConfig, nodeName, rawURI string) (strin
 	}
 
 	node := clientNodeConfig{
-		Name:       name,
-		Server:     server,
-		Password:   password,
-		SNI:        sni,
-		EgressIP:   egressIP,
-		EgressRule: egressRule,
-		URI:        rawURI,
+		Name:          name,
+		Server:        server,
+		Password:      password,
+		SNI:           sni,
+		EgressIP:      egressIP,
+		EgressRule:    egressRule,
+		AllowInsecure: cloneBoolPtr(allowInsecure),
+		CACertPath:    caCertPath,
+		URI:           rawURI,
 	}
 
 	updated := false

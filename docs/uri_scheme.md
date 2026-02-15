@@ -30,6 +30,8 @@ anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...
 
 - `insecure`：是否允许不安全的 TLS 连接。接受 `1` 表示 `true`，`0` 表示 `false`。
 
+- `ca-cert-path`：可选，自定义 CA 证书路径（客户端本地路径）。通常与 `insecure=0` 配合使用，实现“只信任指定 CA”。
+
 - `egress-ip`：可选，指定服务器代理出站时绑定的本地源 IP（需为服务器本机可用地址）。
 
 - `egress-rule`：可选，指定服务器按目标地址匹配出口 IP 的规则，格式示例：
@@ -46,7 +48,22 @@ anytls://letmein@example.com/?sni=127.0.0.1&insecure=1
 anytls://letmein@example.com/?sni=real.example.com&egress-ip=203.0.113.10
 anytls://letmein@example.com/?sni=real.example.com&egress-rule=suffix%3Agoogle.com%3D203.0.113.11%3Bdefault%3D203.0.113.10
 anytls://0fdf77d7-d4ba-455e-9ed9-a98dd6d5489a@[2409:8a71:6a00:1953::615]:8964/?insecure=1
+anytls://letmein@example.com/?sni=real.example.com&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt
 ```
+
+## Go 复用
+
+如需在其他 Go 项目里复用 AnyTLS URI 解析/生成（含 `insecure` 与 `ca-cert-path`），可直接使用：
+
+```go
+import "anytls/proxy/anytlsuri"
+```
+
+提供：
+
+- `anytlsuri.Parse(raw string) (anytlsuri.Node, error)`
+- `anytlsuri.Build(node anytlsuri.Node) (string, error)`
+- `anytlsuri.HasScheme(raw string) bool`
 
 ## 注意事项
 

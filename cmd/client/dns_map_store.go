@@ -185,6 +185,30 @@ func (m *dnsDomainMap) Stats() (ipCount int, mappingCount int) {
 	return ipCount, mappingCount
 }
 
+func (m *dnsDomainMap) Clear() (ipCount int, mappingCount int, blockedDomainCount int, blockedIPCount int) {
+	if m == nil {
+		return 0, 0, 0, 0
+	}
+	now := time.Now()
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.cleanupExpiredLocked(now)
+
+	ipCount = len(m.ipDomains)
+	for _, domainMap := range m.ipDomains {
+		mappingCount += len(domainMap)
+	}
+	blockedDomainCount = len(m.domainBlockedIPs)
+	for _, ipMap := range m.domainBlockedIPs {
+		blockedIPCount += len(ipMap)
+	}
+
+	m.ipDomains = make(map[string]map[string]time.Time)
+	m.domainIPs = make(map[string]map[string]time.Time)
+	m.domainBlockedIPs = make(map[string]map[string]time.Time)
+	return ipCount, mappingCount, blockedDomainCount, blockedIPCount
+}
+
 func (m *dnsDomainMap) RemoveDomains(domains []string) int {
 	if m == nil {
 		return 0

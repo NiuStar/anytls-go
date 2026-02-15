@@ -15,10 +15,103 @@ const WEB_AUTH_STORAGE_KEY = "anytls_web_auth_v1";
 const WEB_AUTH_SESSION_KEY = "anytls_web_auth_session_v1";
 const PROBE_RESULT_STORAGE_PREFIX = "anytls_probe_results_v1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
+const LATENCY_PROBE_TIMEOUT_DEFAULT_MS = 2000;
+const LATENCY_PROBE_TIMEOUT_MAX_MS = 2000;
+const BANDWIDTH_PROBE_TIMEOUT_DEFAULT_MS = 20000;
+const BANDWIDTH_PROBE_TIMEOUT_MIN_MS = 200;
+const BANDWIDTH_PROBE_TIMEOUT_MAX_MS = 120000;
+const BROWSER_PROBE_TARGET_DEFAULT = "https://ip.sb";
+const BROWSER_PROBE_TIMEOUT_DEFAULT_MS = 12000;
+const BROWSER_PROBE_TIMEOUT_MIN_MS = 1000;
+const BROWSER_PROBE_TIMEOUT_MAX_MS = 45000;
 const TUN_TOGGLE_REQUEST_TIMEOUT_MS = 8000;
 const TUN_TOGGLE_POLL_INTERVAL_MS = 1000;
 const TUN_TOGGLE_TASK_TIMEOUT_MS = 150000;
 const DEFAULT_EGRESS_PROBE_TARGET = "https://www.google.com/generate_204";
+const NODE_ALLOW_INSECURE_MODE_VALUES = ["default", "true", "false"];
+const NODE_ALLOW_INSECURE_MODE_LABELS = Object.freeze({
+  default: "默认(未设置)",
+  true: "跳过证书校验",
+  false: "严格校验",
+});
+
+function normalizeNodeAllowInsecureMode(raw, fallback = "default") {
+  const mode = String(raw == null ? "" : raw).trim().toLowerCase();
+  if (NODE_ALLOW_INSECURE_MODE_VALUES.includes(mode)) {
+    return mode;
+  }
+  const normalizedFallback = String(fallback == null ? "" : fallback).trim().toLowerCase();
+  if (NODE_ALLOW_INSECURE_MODE_VALUES.includes(normalizedFallback)) {
+    return normalizedFallback;
+  }
+  return "default";
+}
+
+function nodeAllowInsecureModeFromValue(raw) {
+  if (raw === true) {
+    return "true";
+  }
+  if (raw === false) {
+    return "false";
+  }
+  return "default";
+}
+
+function nodeAllowInsecureValueFromMode(rawMode) {
+  const mode = normalizeNodeAllowInsecureMode(rawMode, "default");
+  if (mode === "true") {
+    return true;
+  }
+  if (mode === "false") {
+    return false;
+  }
+  return null;
+}
+
+function nodeAllowInsecureModeOptions(modeValues, defaultMode = "true") {
+  const out = [];
+  const seen = new Set();
+  const effectiveDefaultMode = normalizeNodeAllowInsecureMode(defaultMode, "true");
+  const appendMode = (rawMode) => {
+    const mode = normalizeNodeAllowInsecureMode(rawMode, "");
+    if (!mode || seen.has(mode)) {
+      return;
+    }
+    seen.add(mode);
+    let label = NODE_ALLOW_INSECURE_MODE_LABELS[mode] || mode;
+    if (mode === "default") {
+      label = `默认(未设置，当前=${NODE_ALLOW_INSECURE_MODE_LABELS[effectiveDefaultMode] || effectiveDefaultMode})`;
+    }
+    out.push({value: mode, label});
+  };
+  if (Array.isArray(modeValues)) {
+    modeValues.forEach((item) => appendMode(item));
+  }
+  NODE_ALLOW_INSECURE_MODE_VALUES.forEach((mode) => appendMode(mode));
+  return out;
+}
+
+function nodeAllowInsecureDefaultModeFromMeta(meta) {
+  const cfg = meta && typeof meta === "object" ? meta : {};
+  const modeRaw = cfg?.allow_insecure_default_mode;
+  if (modeRaw != null && String(modeRaw).trim() !== "") {
+    return normalizeNodeAllowInsecureMode(modeRaw, "true");
+  }
+  if (typeof cfg?.allow_insecure_default === "boolean") {
+    return cfg.allow_insecure_default ? "true" : "false";
+  }
+  return "true";
+}
+
+function nodeAllowInsecureModeLabel(mode, defaultMode = "true") {
+  const normalized = normalizeNodeAllowInsecureMode(mode, "default");
+  if (normalized === "default") {
+    const effectiveDefaultMode = normalizeNodeAllowInsecureMode(defaultMode, "true");
+    const effectiveLabel = NODE_ALLOW_INSECURE_MODE_LABELS[effectiveDefaultMode] || effectiveDefaultMode;
+    return `默认(未设置，当前=${effectiveLabel})`;
+  }
+  return NODE_ALLOW_INSECURE_MODE_LABELS[normalized] || normalized;
+}
 
 function parseAuthRecord(raw) {
   if (!raw) {
@@ -1157,13 +1250,41 @@ function normalizeRoutingGroupEgressMap(values, validNodes = []) {
   return out;
 }
 
-function clampProbeTimeoutMS(value) {
+function clampLatencyProbeTimeoutMS(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) {
-    return 2000;
+    return LATENCY_PROBE_TIMEOUT_DEFAULT_MS;
   }
-  if (n > 2000) {
-    return 2000;
+  if (n > LATENCY_PROBE_TIMEOUT_MAX_MS) {
+    return LATENCY_PROBE_TIMEOUT_MAX_MS;
+  }
+  return Math.round(n);
+}
+
+function clampBandwidthProbeTimeoutMS(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return BANDWIDTH_PROBE_TIMEOUT_DEFAULT_MS;
+  }
+  if (n < BANDWIDTH_PROBE_TIMEOUT_MIN_MS) {
+    return BANDWIDTH_PROBE_TIMEOUT_MIN_MS;
+  }
+  if (n > BANDWIDTH_PROBE_TIMEOUT_MAX_MS) {
+    return BANDWIDTH_PROBE_TIMEOUT_MAX_MS;
+  }
+  return Math.round(n);
+}
+
+function clampBrowserProbeTimeoutMS(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    return BROWSER_PROBE_TIMEOUT_DEFAULT_MS;
+  }
+  if (n < BROWSER_PROBE_TIMEOUT_MIN_MS) {
+    return BROWSER_PROBE_TIMEOUT_MIN_MS;
+  }
+  if (n > BROWSER_PROBE_TIMEOUT_MAX_MS) {
+    return BROWSER_PROBE_TIMEOUT_MAX_MS;
   }
   return Math.round(n);
 }
@@ -1268,6 +1389,8 @@ function App() {
   const [tunCheckLoading, setTunCheckLoading] = useState(false);
   const [tunCheckRaw, setTunCheckRaw] = useState(null);
   const [tunCheckProgress, setTunCheckProgress] = useState(null);
+  const [tunCheckForceCurrentNode, setTunCheckForceCurrentNode] = useState(true);
+  const [dnsMapClearLoading, setDNSMapClearLoading] = useState(false);
   const [tunDNSRepairLoading, setTunDNSRepairLoading] = useState(false);
   const [routeSelfHealLoading, setRouteSelfHealLoading] = useState(false);
   const [routeSelfHealRaw, setRouteSelfHealRaw] = useState(null);
@@ -1322,6 +1445,10 @@ function App() {
   const [routingMatchResult, setRoutingMatchResult] = useState(null);
   const [egressProbeLoading, setEgressProbeLoading] = useState(false);
   const [egressProbeResult, setEgressProbeResult] = useState(null);
+  const [browserProbeLoading, setBrowserProbeLoading] = useState(false);
+  const [browserProbeResult, setBrowserProbeResult] = useState(null);
+  const [browserProbeLoadingByNode, setBrowserProbeLoadingByNode] = useState({});
+  const [browserProbeResultByNode, setBrowserProbeResultByNode] = useState({});
   const [routingHitsLoading, setRoutingHitsLoading] = useState(false);
   const [routingHits, setRoutingHits] = useState([]);
   const [routingHitsStats, setRoutingHitsStats] = useState(null);
@@ -1357,6 +1484,16 @@ function App() {
   const [groupRenameForm] = Form.useForm();
   const [groupRemoveForm] = Form.useForm();
   const probeHydratingRef = useRef(false);
+
+  const nodeTLSMeta = runtimeStatus?.meta?.node_tls || null;
+  const nodeAllowInsecureDefaultMode = useMemo(
+    () => nodeAllowInsecureDefaultModeFromMeta(nodeTLSMeta),
+    [nodeTLSMeta],
+  );
+  const nodeAllowInsecureModeOptionsList = useMemo(
+    () => nodeAllowInsecureModeOptions(nodeTLSMeta?.allow_insecure_modes, nodeAllowInsecureDefaultMode),
+    [nodeTLSMeta, nodeAllowInsecureDefaultMode],
+  );
 
   const nodes = useMemo(() => (config?.nodes || []), [config]);
   const nodeOrderMap = useMemo(() => {
@@ -1706,6 +1843,7 @@ function App() {
         });
         routingForm.setFieldsValue({
           routing_enabled: !!routing.enabled,
+          routing_ipv6_egress_strict: typeof routing.ipv6_egress_strict === "boolean" ? routing.ipv6_egress_strict : true,
           routing_default_action_kind: routingDefault.kind,
           routing_default_action_group: routingDefault.group,
           routing_geoip_enabled: routingGeoIP.enabled,
@@ -1730,6 +1868,7 @@ function App() {
       if (!data.config?.routing) {
         routingForm.setFieldsValue({
           routing_enabled: false,
+          routing_ipv6_egress_strict: true,
           routing_default_action_kind: "group",
           routing_default_action_group: "",
           routing_geoip_enabled: false,
@@ -1965,6 +2104,7 @@ function App() {
         body: JSON.stringify({
           routing: {
             enabled: !!values.routing_enabled,
+            ipv6_egress_strict: !!values.routing_ipv6_egress_strict,
             rules,
             rule_providers: providers,
             group_egress: groupEgress,
@@ -1983,6 +2123,7 @@ function App() {
       setRoutingGroupEgress(normalizeRoutingGroupEgressMap(nextRouting.group_egress || {}, (res.config?.nodes || []).map((n) => n.name)));
       routingForm.setFieldsValue({
         routing_enabled: !!nextRouting.enabled,
+        routing_ipv6_egress_strict: typeof nextRouting.ipv6_egress_strict === "boolean" ? nextRouting.ipv6_egress_strict : true,
         routing_default_action_kind: nextDefaultAction.kind,
         routing_default_action_group: nextDefaultAction.group,
         routing_geoip_enabled: nextRoutingGeoIP.enabled,
@@ -2027,6 +2168,7 @@ function App() {
     }
     const payloadRouting = {
       enabled: !!baseRouting.enabled,
+      ipv6_egress_strict: typeof baseRouting.ipv6_egress_strict === "boolean" ? baseRouting.ipv6_egress_strict : true,
       rules: Array.isArray(baseRouting.rules) ? baseRouting.rules : [],
       rule_providers: (baseRouting.rule_providers && typeof baseRouting.rule_providers === "object") ? baseRouting.rule_providers : {},
       group_egress: normalizeRoutingGroupEgressMap(groupEgress, (nodes || []).map((n) => n.name)),
@@ -2051,6 +2193,7 @@ function App() {
       setRoutingGroupEgress(normalizeRoutingGroupEgressMap(nextRouting.group_egress || {}, (res.config?.nodes || []).map((n) => n.name)));
       routingForm.setFieldsValue({
         routing_enabled: !!nextRouting.enabled,
+        routing_ipv6_egress_strict: typeof nextRouting.ipv6_egress_strict === "boolean" ? nextRouting.ipv6_egress_strict : true,
         routing_default_action_kind: nextDefaultAction.kind,
         routing_default_action_group: nextDefaultAction.group,
         routing_geoip_enabled: nextRoutingGeoIP.enabled,
@@ -2873,10 +3016,20 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     }
   }
 
+  function openAddNode() {
+    manualForm.resetFields();
+    manualForm.setFieldsValue({
+      allow_insecure_mode: nodeAllowInsecureDefaultMode,
+    });
+    setAddNodeVisible(true);
+  }
+
   async function createNode() {
     const values = await manualForm.validateFields();
     setSavingNode(true);
     try {
+      const allowInsecureMode = normalizeNodeAllowInsecureMode(values.allow_insecure_mode, nodeAllowInsecureDefaultMode);
+      const allowInsecureValue = nodeAllowInsecureValueFromMode(allowInsecureMode);
       await api("/api/v1/nodes", {
         method: "POST",
         body: JSON.stringify({
@@ -2886,6 +3039,8 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           sni: values.sni || "",
           egress_ip: values.egress_ip || "",
           egress_rule: values.egress_rule || "",
+          allow_insecure: allowInsecureValue,
+          ca_cert_path: values.ca_cert_path || "",
           groups: normalizeGroupValues(values.groups),
         })
       });
@@ -3127,6 +3282,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
   }
 
   function openEdit(node) {
+    const allowInsecureMode = nodeAllowInsecureModeFromValue(node?.allow_insecure);
     setEditNodeName(node.name);
     editForm.setFieldsValue({
       server: node.server,
@@ -3134,6 +3290,8 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       sni: node.sni || "",
       egress_ip: node.egress_ip || "",
       egress_rule: node.egress_rule || "",
+      allow_insecure_mode: allowInsecureMode,
+      ca_cert_path: node.ca_cert_path || "",
       groups: Array.isArray(node.groups) ? node.groups : [],
     });
     setEditVisible(true);
@@ -3142,12 +3300,16 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
   async function saveNodeEdit() {
     const values = await editForm.validateFields();
     try {
+      const allowInsecureMode = normalizeNodeAllowInsecureMode(values.allow_insecure_mode, "default");
+      const allowInsecureValue = nodeAllowInsecureValueFromMode(allowInsecureMode);
       const payload = {
         server: values.server || "",
         password: values.password || "",
         sni: values.sni || "",
         egress_ip: values.egress_ip || "",
         egress_rule: values.egress_rule || "",
+        allow_insecure: allowInsecureValue,
+        ca_cert_path: values.ca_cert_path || "",
         groups: normalizeGroupValues(values.groups),
       };
       await api(`/api/v1/nodes/${encodeURIComponent(editNodeName)}`, {
@@ -3193,7 +3355,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
               names: [name],
               target: pv.latency_target || "",
               count: pv.latency_count || 3,
-              timeout_ms: clampProbeTimeoutMS(pv.latency_timeout_ms)
+              timeout_ms: clampLatencyProbeTimeoutMS(pv.latency_timeout_ms)
             })
           });
           const item = Array.isArray(res.results) ? res.results[0] : null;
@@ -3259,13 +3421,15 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
         setBandwidthTask({running: true, current: i + 1, total: targetNames.length});
         setBandwidthLoading((prev) => ({...prev, [name]: true}));
         try {
+          const bandwidthTimeoutMS = clampBandwidthProbeTimeoutMS(pv.bandwidth_timeout_ms);
           const res = await api("/api/v1/test/bandwidth", {
             method: "POST",
+            timeoutMS: Math.max(DEFAULT_API_TIMEOUT_MS, bandwidthTimeoutMS + 10000),
             body: JSON.stringify({
               names: [name],
               url: pv.bandwidth_url || "",
               max_bytes: pv.max_bytes || 5242880,
-              timeout_ms: clampProbeTimeoutMS(pv.bandwidth_timeout_ms)
+              timeout_ms: bandwidthTimeoutMS
             })
           });
           const item = Array.isArray(res.results) ? res.results[0] : null;
@@ -3304,6 +3468,110 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
         return next;
       });
     }
+  }
+
+  async function runBrowserAvailabilityProbe(nodeName = "") {
+    const targetNode = String(nodeName || "").trim();
+    if (targetNode) {
+      if (browserProbeLoadingByNode[targetNode]) {
+        return;
+      }
+    } else if (browserProbeLoading) {
+      return;
+    }
+    const pv = probeForm.getFieldsValue();
+    const targetURL = String(pv.browser_probe_url || BROWSER_PROBE_TARGET_DEFAULT).trim() || BROWSER_PROBE_TARGET_DEFAULT;
+    const timeoutMS = clampBrowserProbeTimeoutMS(pv.browser_probe_timeout_ms);
+    if (targetNode) {
+      setBrowserProbeLoadingByNode((prev) => ({...prev, [targetNode]: true}));
+    } else {
+      setBrowserProbeLoading(true);
+    }
+    try {
+      const res = await api("/api/v1/test/browser", {
+        method: "POST",
+        timeoutMS: Math.max(DEFAULT_API_TIMEOUT_MS, timeoutMS + 10000),
+        body: JSON.stringify({
+          name: targetNode,
+          url: targetURL,
+          timeout_ms: timeoutMS
+        })
+      });
+      setBrowserProbeResult(res || null);
+      if (targetNode) {
+        setBrowserProbeResultByNode((prev) => ({
+          ...prev,
+          [targetNode]: {
+            ok: !!res?.ok,
+            error: String(res?.error || "").trim(),
+            error_type: String(res?.error_type || "").trim(),
+            response_preview: String(res?.response_preview || "").trim(),
+            response_status_code: Number(res?.response_status_code || 0),
+            response_fetch_error: String(res?.response_fetch_error || "").trim(),
+            time: res?.time || new Date().toISOString(),
+          }
+        }));
+      }
+      if (res?.ok) {
+        if (targetNode) {
+          message.success(`节点 ${targetNode} 浏览器测试成功 (${targetURL})`);
+        } else {
+          message.success(`浏览器可用性测试成功 (${targetURL})`);
+        }
+      } else {
+        if (targetNode) {
+          message.warning(`节点 ${targetNode} 浏览器测试失败: ${res?.error || "unknown error"}`);
+        } else {
+          message.warning(`浏览器可用性测试失败: ${res?.error || "unknown error"}`);
+        }
+      }
+    } catch (err) {
+      setBrowserProbeResult({
+        ok: false,
+        node: targetNode,
+        url: targetURL,
+        timeout_ms: timeoutMS,
+        error: err.message || String(err),
+        error_type: "request_failed",
+        steps: [{
+          time: new Date().toISOString(),
+          step: "request",
+          detail: err.message || String(err)
+        }]
+      });
+      if (targetNode) {
+        setBrowserProbeResultByNode((prev) => ({
+          ...prev,
+          [targetNode]: {
+            ok: false,
+            error: err.message || String(err),
+            error_type: "request_failed",
+            time: new Date().toISOString(),
+          }
+        }));
+      }
+      if (targetNode) {
+        message.error(`节点 ${targetNode} 浏览器测试失败: ${err.message}`);
+      } else {
+        message.error(`浏览器可用性测试失败: ${err.message}`);
+      }
+    } finally {
+      if (targetNode) {
+        setBrowserProbeLoadingByNode((prev) => ({...prev, [targetNode]: false}));
+      } else {
+        setBrowserProbeLoading(false);
+      }
+    }
+  }
+
+  function formatBrowserProbeStepLine(item, index) {
+    if (!item || typeof item !== "object") {
+      return `${index + 1}. -`;
+    }
+    const timeText = item.time ? formatDateTimeCST(item.time) : "-";
+    const stepText = String(item.step || "-").trim() || "-";
+    const detailText = String(item.detail || "").trim();
+    return `${timeText} [${stepText}]${detailText ? ` ${detailText}` : ""}`;
   }
 
   function probeBatchButtonText(base, task) {
@@ -3389,6 +3657,109 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     return undefined;
   }
 
+  function browserButtonText(name) {
+    if (browserProbeLoadingByNode[name]) {
+      return "...";
+    }
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object") {
+      return "浏览器";
+    }
+    if (row.ok) {
+      return "浏览器✓";
+    }
+    if (String(row.error_type || "").trim() === "dns_path_unstable") {
+      return "DNS异常";
+    }
+    return "浏览器×";
+  }
+
+  function browserButtonStyle(name) {
+    if (browserProbeLoadingByNode[name]) {
+      return undefined;
+    }
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object") {
+      return undefined;
+    }
+    if (row.ok) {
+      return {color: "#52c41a", borderColor: "#52c41a"};
+    }
+    if (String(row.error_type || "").trim() === "dns_path_unstable") {
+      return {color: "#fa8c16", borderColor: "#fa8c16"};
+    }
+    return {color: "#ff4d4f", borderColor: "#ff4d4f"};
+  }
+
+  function browserButtonTooltip(name) {
+    if (browserProbeLoadingByNode[name]) {
+      return "浏览器路径测试进行中";
+    }
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object") {
+      return "点击测试该节点的浏览器一致路径";
+    }
+    const at = row.time ? formatDateTimeCST(row.time) : "-";
+    if (row.ok) {
+      const statusCode = Number(row.response_status_code || 0);
+      const preview = String(row.response_preview || "").trim();
+      const shortPreview = preview.length > 120 ? `${preview.slice(0, 120)}...` : preview;
+      return `上次成功: ${at}${statusCode > 0 ? `\nHTTP: ${statusCode}` : ""}${shortPreview ? `\n返回: ${shortPreview}` : ""}`;
+    }
+    const errType = String(row.error_type || "").trim();
+    const errText = String(row.error || "").trim() || "unknown error";
+    const shortErr = errText.length > 120 ? `${errText.slice(0, 120)}...` : errText;
+    return `上次失败: ${at}${errType ? `\n类型: ${errType}` : ""}\n原因: ${shortErr}`;
+  }
+
+  function browserLastProbeTimeText(name) {
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object" || !row.time) {
+      return "";
+    }
+    const formatted = formatDateTimeCST(row.time);
+    if (!formatted || formatted === "-") {
+      return "";
+    }
+    const parts = String(formatted).split(" ");
+    if (parts.length === 2) {
+      return parts[1];
+    }
+    return formatted;
+  }
+
+  function browserLastProbeSummaryText(name) {
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object") {
+      return "";
+    }
+    const at = browserLastProbeTimeText(name);
+    if (!at) {
+      return "";
+    }
+    if (row.ok) {
+      return `浏览器成功: ${at}`;
+    }
+    if (String(row.error_type || "").trim() === "dns_path_unstable") {
+      return `DNS异常: ${at}`;
+    }
+    return `浏览器失败: ${at}`;
+  }
+
+  function browserLastProbeTagColor(name) {
+    const row = browserProbeResultByNode[name];
+    if (!row || typeof row !== "object") {
+      return "default";
+    }
+    if (row.ok) {
+      return "success";
+    }
+    if (String(row.error_type || "").trim() === "dns_path_unstable") {
+      return "warning";
+    }
+    return "error";
+  }
+
   async function runDiagnose() {
     if (!ensureTunTaskIdle("运行诊断")) {
       return;
@@ -3450,20 +3821,22 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
         message: "正在提交 TUN 连通性测试任务...",
         _logs: appendTunStepLog([], "正在提交 TUN 连通性测试任务...", submitAt),
       });
-      const taskID = await createAsyncTask("tun_check");
+      const taskID = await createAsyncTask("tun_check", {
+        force_current_node: !!tunCheckForceCurrentNode,
+      });
       activeTaskID = taskID;
       const nowMS = Date.now();
       setTunCheckProgress((prev) => ({
         id: taskID,
         status: "pending",
-        message: "TUN 测试任务已入队，等待执行...",
+        message: tunCheckForceCurrentNode ? "TUN 测试任务已入队，等待执行（强制当前节点）..." : "TUN 测试任务已入队，等待执行...",
         queue_position: 0,
         queue_total: 0,
         queue_eta_seconds: 0,
         elapsed_seconds: 0,
         _enqueued_at_ms: nowMS,
         _fallback_eta_seconds: 45,
-        _logs: appendTunStepLog(prev?._logs, "TUN 测试任务已入队，等待执行...", nowMS),
+        _logs: appendTunStepLog(prev?._logs, tunCheckForceCurrentNode ? "TUN 测试任务已入队，等待执行（强制当前节点）..." : "TUN 测试任务已入队，等待执行...", nowMS),
       }));
       setTunProgressTick(nowMS);
       const task = await waitTaskDone(taskID, {
@@ -3541,11 +3914,30 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
   }
 
   async function runTunCheckTaskForReport() {
-    const taskID = await createAsyncTask("tun_check");
+    const taskID = await createAsyncTask("tun_check", {
+      force_current_node: !!tunCheckForceCurrentNode,
+    });
     const task = await waitTaskDone(taskID, {timeoutMS: TUN_TOGGLE_TASK_TIMEOUT_MS});
     const res = task?.result || {};
     setTunCheckRaw(res || null);
     return res;
+  }
+
+  async function clearDNSMapCache() {
+    setDNSMapClearLoading(true);
+    try {
+      const res = await api("/api/v1/routing/dns_map/clear", {
+        method: "POST",
+      });
+      const removed = toPositiveInt(res?.removed_mappings);
+      const blocked = toPositiveInt(res?.removed_blocked_ip);
+      message.success(`DNS 映射已清空：映射 ${removed} 条，屏蔽 ${blocked} 条`);
+      await refreshStatus();
+    } catch (err) {
+      message.error(`清空 DNS 映射失败: ${err.message}`);
+    } finally {
+      setDNSMapClearLoading(false);
+    }
   }
 
   async function repairOpenWrtDNSFromTunCheck() {
@@ -4165,6 +4557,53 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     await setGroupEgressAndSave(section.group, record.name);
   }
 
+  function nodeTLSModeMeta(record) {
+    const hasSetting = Object.prototype.hasOwnProperty.call(record || {}, "allow_insecure")
+      && record?.allow_insecure !== null
+      && record?.allow_insecure !== undefined;
+    if (!hasSetting) {
+      const effectiveDefault = normalizeNodeAllowInsecureMode(nodeAllowInsecureDefaultMode, "true");
+      const effectiveStrict = effectiveDefault === "false";
+      return {
+        label: nodeAllowInsecureModeLabel("default", nodeAllowInsecureDefaultMode),
+        color: effectiveStrict ? "green" : "default",
+      };
+    }
+    const mode = nodeAllowInsecureModeFromValue(record?.allow_insecure);
+    if (mode === "true") {
+      return {label: nodeAllowInsecureModeLabel(mode, nodeAllowInsecureDefaultMode), color: "orange"};
+    }
+    return {label: nodeAllowInsecureModeLabel(mode, nodeAllowInsecureDefaultMode), color: "green"};
+  }
+
+  function trimTagText(value, max = 36) {
+    const text = String(value || "").trim();
+    if (!text) {
+      return "";
+    }
+    if (text.length <= max) {
+      return text;
+    }
+    return `${text.slice(0, Math.max(0, max - 1))}…`;
+  }
+
+  function renderNodeTLSTags(record, compact = false) {
+    const mode = nodeTLSModeMeta(record);
+    const caPath = String(record?.ca_cert_path || "").trim();
+    return (
+      <Space size={[4, 4]} wrap>
+        <Tag color={mode.color}>{mode.label}</Tag>
+        {caPath ? (
+          <Tooltip title={caPath}>
+            <Tag color="cyan">{compact ? "CA已配置" : `CA: ${trimTagText(caPath)}`}</Tag>
+          </Tooltip>
+        ) : (
+          <Tag>CA未配置</Tag>
+        )}
+      </Space>
+    );
+  }
+
   function buildNodeColumnsForSection(section) {
     return [
       {
@@ -4173,6 +4612,12 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
         render: (_, record) => <Typography.Text strong>{record.name}</Typography.Text>
       },
       {title: "协议", dataIndex: "protocol", width: 110, render: () => <Tag color="processing">AnyTLS</Tag>},
+      {
+        title: "TLS",
+        dataIndex: "allow_insecure",
+        width: 260,
+        render: (_, record) => renderNodeTLSTags(record, false)
+      },
       {
         title: "状态",
         dataIndex: "name",
@@ -4197,6 +4642,19 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
             <Button size="small" onClick={() => openEdit(record)}>修改</Button>
             <Button size="small" style={latencyButtonStyle(record.name)} loading={!!latencyLoading[record.name]} onClick={() => runLatency([record.name])}>{latencyButtonText(record.name)}</Button>
             <Button size="small" style={bandwidthButtonStyle(record.name)} loading={!!bandwidthLoading[record.name]} onClick={() => runBandwidth([record.name])}>{bandwidthButtonText(record.name)}</Button>
+            <Tooltip title={browserButtonTooltip(record.name)}>
+              <Button
+                size="small"
+                style={browserButtonStyle(record.name)}
+                loading={!!browserProbeLoadingByNode[record.name]}
+                onClick={() => runBrowserAvailabilityProbe(record.name)}
+              >
+                {browserButtonText(record.name)}
+              </Button>
+            </Tooltip>
+            {browserLastProbeSummaryText(record.name) ? (
+              <Tag color={browserLastProbeTagColor(record.name)}>{browserLastProbeSummaryText(record.name)}</Tag>
+            ) : null}
             <Popconfirm title={`删除 ${record.name} ?`} onConfirm={() => deleteNode(record.name)}>
               <Button danger size="small">删除</Button>
             </Popconfirm>
@@ -4529,7 +4987,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           <Space className="page-header-actions">
             <Button onClick={logout}>退出登录</Button>
             <Button icon={<SettingOutlined />} onClick={() => setConfigVisible(true)}>基础配置</Button>
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setAddNodeVisible(true)}>新增节点</Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={openAddNode}>新增节点</Button>
           </Space>
         </div>
         <Space direction="vertical" style={{display: "flex"}}>
@@ -4582,6 +5040,9 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                 </Tag>
               ) : null}
               <Tag color={runtimeStatus?.routing?.enabled ? "blue" : "default"}>规则分流: {runtimeStatus?.routing?.enabled ? "开启" : "关闭"}</Tag>
+              <Tag color={runtimeStatus?.routing?.ipv6_egress_strict ? "green" : "default"}>
+                IPv6严格: {runtimeStatus?.routing?.ipv6_egress_strict ? "开启" : "关闭"}
+              </Tag>
               {runtimeStatus?.routing?.recent_node ? (
                 <Tooltip title={`${runtimeStatus?.routing?.recent_destination || "-"} · ${runtimeStatus?.routing?.recent_rule || "-"}`}>
                   <Tag color="cyan">最近出口: {runtimeStatus?.routing?.recent_node}</Tag>
@@ -4590,10 +5051,19 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
               {runtimeStatus?.routing?.recent_time ? (
                 <Tag color="default">最近路由: {formatDateTimeCST(runtimeStatus?.routing?.recent_time)}</Tag>
               ) : null}
+              <Tag color={(runtimeStatus?.routing?.live_hits_60s_node || 0) > 0 ? "green" : "default"}>
+                实时流量60s: NODE {runtimeStatus?.routing?.live_hits_60s_node || 0}
+                {" / "}DIRECT {runtimeStatus?.routing?.live_hits_60s_direct || 0}
+                {" / "}REJECT {runtimeStatus?.routing?.live_hits_60s_reject || 0}
+                {" / "}TOTAL {runtimeStatus?.routing?.live_hits_60s_total || 0}
+              </Tag>
               <Tag>DNS映射: {runtimeStatus?.routing?.dns_map_match_count || 0} 条</Tag>
               <Tag>DNS上游: {runtimeStatus?.routing?.dns_upstream_count || 0}</Tag>
               <Tag color={(runtimeStatus?.routing?.dns_query_failure || 0) > 0 ? "red" : "green"}>
                 DNS请求: {(runtimeStatus?.routing?.dns_query_success || 0)} 成功 / {(runtimeStatus?.routing?.dns_query_failure || 0)} 失败
+              </Tag>
+              <Tag color={(runtimeStatus?.routing?.dns_family_filtered || 0) > 0 ? "orange" : "default"}>
+                DNS家族过滤: {runtimeStatus?.routing?.dns_family_filtered || 0}
               </Tag>
               <Tag color={(runtimeStatus?.bypass?.node_failed || 0) > 0 ? "red" : "green"}>
                 节点旁路: {(runtimeStatus?.bypass?.node_success || 0)} / {(runtimeStatus?.bypass?.node_total || 0)}
@@ -4678,20 +5148,30 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                       <Form form={probeForm} layout="inline" initialValues={{
                         latency_target: "1.1.1.1:443",
                         latency_count: 3,
-                        latency_timeout_ms: 2000,
+                        latency_timeout_ms: LATENCY_PROBE_TIMEOUT_DEFAULT_MS,
                         egress_probe_target: DEFAULT_EGRESS_PROBE_TARGET,
+                        browser_probe_url: BROWSER_PROBE_TARGET_DEFAULT,
+                        browser_probe_timeout_ms: BROWSER_PROBE_TIMEOUT_DEFAULT_MS,
                         bandwidth_url: "https://speed.cloudflare.com/__down?bytes=5000000",
                         max_bytes: 5242880,
-                        bandwidth_timeout_ms: 2000
+                        bandwidth_timeout_ms: BANDWIDTH_PROBE_TIMEOUT_DEFAULT_MS
                       }}>
                         <Form.Item name="latency_target" label="延迟目标"><Input style={{width: 180}} /></Form.Item>
                         <Form.Item name="latency_count" label="次数"><InputNumber min={1} max={10} /></Form.Item>
-                        <Form.Item name="latency_timeout_ms" label="延迟超时(ms)"><InputNumber min={200} max={2000} /></Form.Item>
+                        <Form.Item name="latency_timeout_ms" label="延迟超时(ms)"><InputNumber min={200} max={LATENCY_PROBE_TIMEOUT_MAX_MS} /></Form.Item>
                         <Form.Item name="egress_probe_target" label="出口验证 URL"><Input style={{width: 320}} /></Form.Item>
+                        <Form.Item name="browser_probe_url" label="浏览器测试 URL"><Input style={{width: 240}} /></Form.Item>
+                        <Form.Item name="browser_probe_timeout_ms" label="浏览器超时(ms)"><InputNumber min={BROWSER_PROBE_TIMEOUT_MIN_MS} max={BROWSER_PROBE_TIMEOUT_MAX_MS} /></Form.Item>
                         <Form.Item name="bandwidth_url" label="测速 URL"><Input style={{width: 360}} /></Form.Item>
                         <Form.Item name="max_bytes" label="测速字节"><InputNumber min={262144} max={209715200} /></Form.Item>
-                        <Form.Item name="bandwidth_timeout_ms" label="带宽超时(ms)"><InputNumber min={200} max={2000} /></Form.Item>
+                        <Form.Item name="bandwidth_timeout_ms" label="带宽超时(ms)"><InputNumber min={BANDWIDTH_PROBE_TIMEOUT_MIN_MS} max={BANDWIDTH_PROBE_TIMEOUT_MAX_MS} /></Form.Item>
                       </Form>
+                      <Alert
+                        style={{marginTop: 8, marginBottom: 12}}
+                        type="info"
+                        showIcon
+                        message="延迟/带宽测速是“节点直连探测”，不等于浏览器真实流量链路。浏览器是否走节点，请看上方“实时流量60s”或“命中测试”里 source=live 的记录。"
+                      />
                       <Divider />
                       <Space style={{marginBottom: 12}} wrap>
                         <Select
@@ -4708,10 +5188,17 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                         </Tag>
                         <Button
                           loading={egressProbeLoading}
-                          disabled={latencyTask.running || bandwidthTask.running}
+                          disabled={latencyTask.running || bandwidthTask.running || browserProbeLoading}
                           onClick={() => runEgressQuickProbe("", selectedGroupEgressNode || "", false)}
                         >
                           出口验证
+                        </Button>
+                        <Button
+                          loading={browserProbeLoading}
+                          disabled={latencyTask.running || bandwidthTask.running || egressProbeLoading}
+                          onClick={runBrowserAvailabilityProbe}
+                        >
+                          浏览器可用性(ip.sb)
                         </Button>
                         {egressProbeResult ? (
                           <Tag color={egressProbeResult?.ok ? "success" : "error"}>
@@ -4720,8 +5207,17 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                             {Number(egressProbeResult?.status_code || 0) > 0 ? ` · HTTP ${Number(egressProbeResult?.status_code || 0)}` : ""}
                           </Tag>
                         ) : null}
+                        {browserProbeResult ? (
+                          <Tag color={browserProbeResult?.ok ? "success" : "error"}>
+                            浏览器链路: {browserProbeResult?.ok ? "成功" : "失败"}
+                            {String(browserProbeResult?.error_type || "").trim() ? ` · ${String(browserProbeResult?.error_type || "").trim()}` : ""}
+                          </Tag>
+                        ) : null}
                         {egressProbeResult?.time ? (
                           <Tag>探测时间: {formatDateTimeCST(egressProbeResult?.time)}</Tag>
+                        ) : null}
+                        {browserProbeResult?.time ? (
+                          <Tag>浏览器测试: {formatDateTimeCST(browserProbeResult?.time)}</Tag>
                         ) : null}
                         <Button
                           loading={latencyTask.running && latencyTask.total === groupActionNodes.length && latencyTask.total > 0}
@@ -4741,6 +5237,49 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                         <Button disabled={!nodeGroupAction} onClick={() => exportNodesByGroup("json")}>导出组 JSON</Button>
                         <Button onClick={openGroupManage}>分组管理</Button>
                       </Space>
+                      {browserProbeResult ? (
+                        <Alert
+                          style={{marginBottom: 12}}
+                          type={browserProbeResult?.ok ? "success" : "warning"}
+                          showIcon
+                          message={browserProbeResult?.ok ? "浏览器一致路径测试成功" : `浏览器一致路径测试失败: ${browserProbeResult?.error || "-"}`}
+                          description={
+                            <Space direction="vertical" style={{display: "flex"}}>
+                              {(Number(browserProbeResult?.response_status_code || 0) > 0 || String(browserProbeResult?.response_preview || "").trim() || String(browserProbeResult?.response_fetch_error || "").trim()) ? (
+                                <div>
+                                  <Typography.Text strong>返回结果</Typography.Text>
+                                  {Number(browserProbeResult?.response_status_code || 0) > 0 ? (
+                                    <Tag style={{marginLeft: 8}}>HTTP {Number(browserProbeResult?.response_status_code || 0)}</Tag>
+                                  ) : null}
+                                  {String(browserProbeResult?.response_fetch_error || "").trim() ? (
+                                    <Alert
+                                      style={{marginTop: 6}}
+                                      type="warning"
+                                      showIcon
+                                      message={`结果读取失败: ${String(browserProbeResult?.response_fetch_error || "").trim()}`}
+                                    />
+                                  ) : null}
+                                  {String(browserProbeResult?.response_preview || "").trim() ? (
+                                    <pre style={{marginTop: 6, marginBottom: 0, whiteSpace: "pre-wrap", maxHeight: 140, overflow: "auto"}}>
+                                      {String(browserProbeResult?.response_preview || "").trim()}
+                                    </pre>
+                                  ) : null}
+                                </div>
+                              ) : null}
+                              <div>
+                                <Typography.Text strong>步骤日志</Typography.Text>
+                                {Array.isArray(browserProbeResult?.steps) && browserProbeResult.steps.length > 0 ? (
+                                  <pre style={{marginTop: 6, marginBottom: 0, whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto"}}>
+                                    {browserProbeResult.steps.map((item, index) => formatBrowserProbeStepLine(item, index)).join("\n")}
+                                  </pre>
+                                ) : (
+                                  <Typography.Text type="secondary">无步骤日志</Typography.Text>
+                                )}
+                              </div>
+                            </Space>
+                          }
+                        />
+                      ) : null}
                       <Alert
                         style={{marginBottom: 12}}
                         type="info"
@@ -4748,7 +5287,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                         message="每个分组单独成列表。点击节点右侧“设为本组出口”会立即保存；该节点成为出口后按钮会变为绿色“出口”。"
                       />
                       <Space style={{marginBottom: 12}} wrap>
-                        <Button type="primary" onClick={() => setAddNodeVisible(true)}>新增节点</Button>
+                        <Button type="primary" onClick={openAddNode}>新增节点</Button>
                         <Button
                           loading={latencyTask.running && latencyTask.total === nodes.length && latencyTask.total > 0}
                           disabled={nodes.length === 0 || latencyTask.running || bandwidthTask.running}
@@ -4825,6 +5364,9 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                                       </Checkbox>
                                       {record.name === current ? <Tag color="blue">当前</Tag> : <Tag>待机</Tag>}
                                     </Space>
+                                    <Space style={{marginTop: 8}} wrap>
+                                      {renderNodeTLSTags(record, true)}
+                                    </Space>
                                     <Space style={{marginTop: 10}} wrap>
                                       {isSectionEgressNode(section, record.name) ? (
                                         <Button
@@ -4840,6 +5382,19 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                                       <Button size="small" onClick={() => openEdit(record)}>修改</Button>
                                       <Button size="small" style={latencyButtonStyle(record.name)} loading={!!latencyLoading[record.name]} onClick={() => runLatency([record.name])}>{latencyButtonText(record.name)}</Button>
                                       <Button size="small" style={bandwidthButtonStyle(record.name)} loading={!!bandwidthLoading[record.name]} onClick={() => runBandwidth([record.name])}>{bandwidthButtonText(record.name)}</Button>
+                                      <Tooltip title={browserButtonTooltip(record.name)}>
+                                        <Button
+                                          size="small"
+                                          style={browserButtonStyle(record.name)}
+                                          loading={!!browserProbeLoadingByNode[record.name]}
+                                          onClick={() => runBrowserAvailabilityProbe(record.name)}
+                                        >
+                                          {browserButtonText(record.name)}
+                                        </Button>
+                                      </Tooltip>
+                                      {browserLastProbeSummaryText(record.name) ? (
+                                        <Tag color={browserLastProbeTagColor(record.name)}>{browserLastProbeSummaryText(record.name)}</Tag>
+                                      ) : null}
                                       <Popconfirm title={`删除 ${record.name} ?`} onConfirm={() => deleteNode(record.name)}>
                                         <Button danger size="small">删除</Button>
                                       </Popconfirm>
@@ -4890,6 +5445,14 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                       </Space>
                       <Form form={routingForm} layout="vertical">
                         <Form.Item label="启用规则分流" name="routing_enabled" valuePropName="checked">
+                          <Switch />
+                        </Form.Item>
+                        <Form.Item
+                          label="IPv6 出口严格模式"
+                          name="routing_ipv6_egress_strict"
+                          valuePropName="checked"
+                          tooltip="当目标是 IPv4 但节点 egress_ip 为 IPv6 且无域名提示时，阻断 UDP/QUIC，强制回落 TCP 走域名解析，避免本地 DNS 家族漂移导致证书/连通性异常。"
+                        >
                           <Switch />
                         </Form.Item>
                         <Form.Item label="默认兜底动作（未命中任意规则时）" required>
@@ -5812,9 +6375,12 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
             <Form.Item label="启用时关闭其他代理(macOS)" name="tun_disable_other_proxies" valuePropName="checked"><Switch /></Form.Item>
           </Space>
           <Typography.Text type="secondary">TUN 开关会立即生效：开启后接管全局流量，关闭后恢复普通网络。</Typography.Text>
-          <div style={{marginTop: 8}}>
+          <Space style={{marginTop: 8}} wrap>
             <Button size="small" onClick={runTunCheck} loading={tunCheckLoading} disabled={tunTaskBusy}>测试连接(TUN)</Button>
-          </div>
+            <Switch checked={tunCheckForceCurrentNode} onChange={setTunCheckForceCurrentNode} disabled={tunTaskBusy || tunCheckLoading} />
+            <Typography.Text type="secondary">强制当前节点探测（绕过 DEFAULT 路由）</Typography.Text>
+            <Button size="small" onClick={clearDNSMapCache} loading={dnsMapClearLoading}>清空 DNS 映射</Button>
+          </Space>
           {tunTaskProgress ? (
             <Alert
               style={{marginTop: 10}}
@@ -5965,6 +6531,15 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                   </Form.Item>
                   <Form.Item name="egress_ip" label="egress-ip"><Input style={{width: 150}} /></Form.Item>
                   <Form.Item name="egress_rule" label="egress-rule"><Input style={{width: 220}} /></Form.Item>
+                  <Form.Item name="allow_insecure_mode" label="证书校验策略">
+                    <Select
+                      style={{width: 180}}
+                      options={nodeAllowInsecureModeOptionsList}
+                    />
+                  </Form.Item>
+                  <Form.Item name="ca_cert_path" label="CA证书路径">
+                    <Input style={{width: 260}} placeholder="/path/to/ca.crt" />
+                  </Form.Item>
                   <Form.Item>
                     <Button type="primary" loading={savingNode} onClick={createNode}>新增</Button>
                   </Form.Item>
@@ -6331,6 +6906,10 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           </Form.Item>
           <Form.Item label="egress-ip" name="egress_ip"><Input /></Form.Item>
           <Form.Item label="egress-rule" name="egress_rule"><Input /></Form.Item>
+          <Form.Item label="证书校验策略" name="allow_insecure_mode">
+            <Select options={nodeAllowInsecureModeOptionsList} />
+          </Form.Item>
+          <Form.Item label="CA证书路径" name="ca_cert_path"><Input /></Form.Item>
         </Form>
       </Modal>
 

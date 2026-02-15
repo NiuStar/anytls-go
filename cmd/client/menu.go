@@ -95,7 +95,7 @@ func runClientMenu(ctx context.Context) error {
 				fmt.Println()
 				continue
 			}
-			if err := runCLI(configPath, "", "stop", "", "", "", clientNodeConfig{}); err != nil {
+			if err := runCLI(configPath, "", "stop", "", "", "", clientNodeConfig{}, cliNodeUpdateOptions{}); err != nil {
 				fmt.Println("停止失败:", err)
 			} else {
 				fmt.Println("已发送停止请求。")

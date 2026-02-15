@@ -452,7 +452,7 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 	desired := make(map[string]clientNodeConfig, len(items))
 	used := make(map[string]struct{}, len(items))
 	for i, item := range items {
-		server, password, sni, egressIP, egressRule, err := parseNodeURI(item.URI)
+		server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseNodeURI(item.URI)
 		if err != nil {
 			continue
 		}
@@ -463,15 +463,17 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 		name := allocateSubscriptionNodeName(baseName, sub.ID, existingSource, used)
 		mergedGroups := normalizeNodeGroups(append(append([]string(nil), sub.Groups...), item.Groups...))
 		desired[name] = clientNodeConfig{
-			Name:       name,
-			Server:     server,
-			Password:   password,
-			SNI:        sni,
-			EgressIP:   egressIP,
-			EgressRule: egressRule,
-			Groups:     mergedGroups,
-			SourceID:   sub.ID,
-			URI:        strings.TrimSpace(item.URI),
+			Name:          name,
+			Server:        server,
+			Password:      password,
+			SNI:           sni,
+			EgressIP:      egressIP,
+			EgressRule:    egressRule,
+			AllowInsecure: cloneBoolPtr(allowInsecure),
+			CACertPath:    caCertPath,
+			Groups:        mergedGroups,
+			SourceID:      sub.ID,
+			URI:           strings.TrimSpace(item.URI),
 		}
 	}
 	if len(desired) == 0 {

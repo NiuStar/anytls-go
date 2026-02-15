@@ -2,6 +2,8 @@ package main
 
 import (
 	"anytls/proxy"
+	"anytls/proxy/nodeopts"
+	"anytls/proxy/tlsopts"
 	"anytls/util"
 	"context"
 	"crypto/tls"
@@ -124,6 +126,13 @@ func main() {
 	password := flag.String("p", "", "Password")
 	egressIP := flag.String("egress-ip", "", "Server egress source IP")
 	egressRule := flag.String("egress-rule", "", "Server egress rule")
+	allowInsecureRaw := flag.String("allow-insecure", "", "Skip TLS certificate verification (true/false)")
+	caCertPath := flag.String("ca-cert-path", "", "CA certificate path for TLS verification")
+	clearSNI := flag.Bool("clear-sni", false, "Clear node SNI when -mode cli -cmd update")
+	clearEgressIP := flag.Bool("clear-egress-ip", false, "Clear node egress_ip when -mode cli -cmd update")
+	clearEgressRule := flag.Bool("clear-egress-rule", false, "Clear node egress_rule when -mode cli -cmd update")
+	clearCACertPath := flag.Bool("clear-ca-cert-path", false, "Clear node ca_cert_path when -mode cli -cmd update")
+	clearAllowInsecure := flag.Bool("clear-allow-insecure", false, "Clear node allow_insecure when -mode cli -cmd update")
 	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
 
 	configPath := flag.String("config", "", "Client config file path (JSON)")
@@ -135,6 +144,11 @@ func main() {
 	flag.Parse()
 
 	logrus.Infoln("[Client]", util.BuildInfo())
+
+	allowInsecure, err := parseAllowInsecureFlag(*allowInsecureRaw)
+	if err != nil {
+		logrus.Fatalln(err)
+	}
 
 	if *mode == "api" {
 		cfgPath := *configPath
@@ -157,11 +171,19 @@ func main() {
 			}
 		}
 		if err := runCLI(cfgPath, *controlAddr, *controlCmd, *nodeName, *nodeURI, *backupName, clientNodeConfig{
-			Server:     *serverAddr,
-			Password:   *password,
-			SNI:        *sni,
-			EgressIP:   *egressIP,
-			EgressRule: *egressRule,
+			Server:        *serverAddr,
+			Password:      *password,
+			SNI:           *sni,
+			EgressIP:      *egressIP,
+			EgressRule:    *egressRule,
+			AllowInsecure: cloneBoolPtr(allowInsecure),
+			CACertPath:    strings.TrimSpace(*caCertPath),
+		}, cliNodeUpdateOptions{
+			ClearSNI:           *clearSNI,
+			ClearEgressIP:      *clearEgressIP,
+			ClearEgressRule:    *clearEgressRule,
+			ClearCACertPath:    *clearCACertPath,
+			ClearAllowInsecure: *clearAllowInsecure,
 		}); err != nil {
 			logrus.Fatalln(err)
 		}
@@ -176,7 +198,7 @@ func main() {
 		logrus.Fatalln("-cmd requires -config")
 	}
 
-	runWithSingleNode(ctx, listen, serverAddr, sni, password, egressIP, egressRule, minIdleSession)
+	runWithSingleNode(ctx, listen, serverAddr, sni, password, egressIP, egressRule, allowInsecure, caCertPath, minIdleSession)
 }
 
 func isVersionArg(arg string) bool {
@@ -322,7 +344,7 @@ func runWithConfig(ctx context.Context, configPath string, listen *string, minId
 	runClientListener(ctx, *listen, newRoutingInbound(manager, routingEngine, mitm))
 }
 
-func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, egressIP, egressRule *string, minIdleSession *int) {
+func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, egressIP, egressRule *string, allowInsecure *bool, caCertPath *string, minIdleSession *int) {
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
 		if serverURL.Scheme == "anytls" {
 			*serverAddr = serverURL.Host
@@ -336,6 +358,16 @@ func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, e
 			}
 			if queryEgressRule := query.Get("egress-rule"); queryEgressRule != "" {
 				*egressRule = queryEgressRule
+			}
+			if allowInsecure == nil {
+				if uriInsecure := parseOptionalBoolString(firstQueryValue(query, "insecure", "allow-insecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify")); uriInsecure != nil {
+					allowInsecure = cloneBoolPtr(uriInsecure)
+				}
+			}
+			if strings.TrimSpace(*caCertPath) == "" {
+				if uriCACertPath := firstQueryValue(query, "ca-cert-path", "ca_cert_path", "ca-cert", "ca_cert"); uriCACertPath != "" {
+					*caCertPath = uriCACertPath
+				}
 			}
 		}
 	}
@@ -358,12 +390,14 @@ func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, e
 	}
 
 	client, err := buildClientFromNode(ctx, clientNodeConfig{
-		Name:       "single",
-		Server:     *serverAddr,
-		Password:   *password,
-		SNI:        *sni,
-		EgressIP:   *egressIP,
-		EgressRule: *egressRule,
+		Name:          "single",
+		Server:        *serverAddr,
+		Password:      *password,
+		SNI:           *sni,
+		EgressIP:      *egressIP,
+		EgressRule:    *egressRule,
+		AllowInsecure: cloneBoolPtr(allowInsecure),
+		CACertPath:    strings.TrimSpace(*caCertPath),
 	}, *minIdleSession)
 	if err != nil {
 		logrus.Fatalln(err)
@@ -433,13 +467,15 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		return nil, fmt.Errorf("invalid server address: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
-		ServerName:         node.SNI,
-		InsecureSkipVerify: true,
-	}
-	if tlsConfig.ServerName == "" {
-		// disable SNI
-		tlsConfig.ServerName = "127.0.0.1"
+	allowInsecure := nodeAllowInsecure(node)
+	tlsConfig, err := tlsopts.BuildClientConfig(tlsopts.ClientOptions{
+		Server:        strings.TrimSpace(node.Server),
+		SNI:           strings.TrimSpace(node.SNI),
+		AllowInsecure: allowInsecure,
+		CACertPath:    strings.TrimSpace(node.CACertPath),
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
@@ -558,6 +594,14 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		}
 		return tlsConn, nil
 	}, minIdleSession, node.EgressIP, node.EgressRule, node.Password, label), nil
+}
+
+func parseAllowInsecureFlag(raw string) (*bool, error) {
+	v, err := nodeopts.ParseOptionalBoolStrict(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --allow-insecure value %q, expect true/false", strings.TrimSpace(raw))
+	}
+	return v, nil
 }
 
 func isLikelyTunLoopAddr(addr net.Addr) bool {

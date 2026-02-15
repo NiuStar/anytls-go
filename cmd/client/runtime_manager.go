@@ -148,7 +148,9 @@ func nodeClientRuntimeChanged(a, b clientNodeConfig) bool {
 		a.Password != b.Password ||
 		a.SNI != b.SNI ||
 		a.EgressIP != b.EgressIP ||
-		a.EgressRule != b.EgressRule
+		a.EgressRule != b.EgressRule ||
+		a.CACertPath != b.CACertPath ||
+		nodeAllowInsecure(a) != nodeAllowInsecure(b)
 }
 
 func (m *runtimeClientManager) Close() error {

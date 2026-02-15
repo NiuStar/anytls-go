@@ -27,23 +27,36 @@ import (
 	xproxy "golang.org/x/net/proxy"
 )
 
-type dnsHijacker struct {
-	domainMap *dnsDomainMap
-	upstreams []string
-	doh       []dnsDoHUpstream
-	timeout   time.Duration
-	openwrt   bool
-	socks     string
-	dialer    xproxy.Dialer
-	dialTO    time.Duration
-	lastAAAA  time.Time
-	mu        sync.Mutex
-	health    map[string]*dnsUpstreamHealth
+var dnsDisallowedUpstreamPrefixes = func() []netip.Prefix {
+	out := make([]netip.Prefix, 0, 1)
+	// RFC 2544 benchmark/test range. This is commonly used as local TUN address
+	// space and must never be used as recursive DNS upstream.
+	if prefix, err := netip.ParsePrefix("198.18.0.0/15"); err == nil {
+		out = append(out, prefix)
+	}
+	return out
+}()
 
-	udpQueries uint64
-	tcpQueries uint64
-	successes  uint64
-	failures   uint64
+type dnsHijacker struct {
+	domainMap           *dnsDomainMap
+	upstreams           []string
+	doh                 []dnsDoHUpstream
+	timeout             time.Duration
+	openwrt             bool
+	darwinPublicDoHOnly bool
+	resolveDomainFamily func(domain string) nodeEgressIPFamily
+	socks               string
+	dialer              xproxy.Dialer
+	dialTO              time.Duration
+	lastAAAA            time.Time
+	mu                  sync.Mutex
+	health              map[string]*dnsUpstreamHealth
+
+	udpQueries     uint64
+	tcpQueries     uint64
+	successes      uint64
+	failures       uint64
+	familyFiltered uint64
 }
 
 type dnsSocksContextDialer interface {
@@ -91,14 +104,15 @@ func newDNSHijacker(domainMap *dnsDomainMap, socksListen string) *dnsHijacker {
 	}
 	dohUpstreams := defaultDoHUpstreams()
 	h := &dnsHijacker{
-		domainMap: domainMap,
-		upstreams: upstreams,
-		doh:       dohUpstreams,
-		timeout:   1500 * time.Millisecond,
-		openwrt:   runtime.GOOS == "linux" && isOpenWrtRuntime(),
-		socks:     strings.TrimSpace(socksListen),
-		dialTO:    3 * time.Second,
-		health:    make(map[string]*dnsUpstreamHealth, len(upstreams)),
+		domainMap:           domainMap,
+		upstreams:           upstreams,
+		doh:                 dohUpstreams,
+		timeout:             1500 * time.Millisecond,
+		openwrt:             runtime.GOOS == "linux" && isOpenWrtRuntime(),
+		darwinPublicDoHOnly: runtime.GOOS == "darwin",
+		socks:               strings.TrimSpace(socksListen),
+		dialTO:              3 * time.Second,
+		health:              make(map[string]*dnsUpstreamHealth, len(upstreams)),
 	}
 	if h.timeout > h.dialTO {
 		h.dialTO = h.timeout
@@ -148,9 +162,9 @@ func (h *dnsHijacker) RouteBypassTargets() []string {
 	if h == nil {
 		return nil
 	}
-	// On OpenWrt keep all DNS targets out of bypass list, otherwise dns queries
-	// may escape to polluted physical uplink instead of staying in the proxy path.
-	if h.openwrt {
+	// Keep DNS targets out of bypass list on OpenWrt and macOS, otherwise DNS
+	// queries can escape to physical uplink and trigger polluted/certificate-mismatch paths.
+	if h.openwrt || runtime.GOOS == "darwin" {
 		return nil
 	}
 	return h.Upstreams()
@@ -164,6 +178,22 @@ func (h *dnsHijacker) Snapshot() (udpQueries, tcpQueries, successes, failures ui
 		atomic.LoadUint64(&h.tcpQueries),
 		atomic.LoadUint64(&h.successes),
 		atomic.LoadUint64(&h.failures)
+}
+
+func (h *dnsHijacker) FamilyFilteredCount() uint64 {
+	if h == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&h.familyFiltered)
+}
+
+func (h *dnsHijacker) SetDomainFamilyResolver(resolver func(domain string) nodeEgressIPFamily) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.resolveDomainFamily = resolver
+	h.mu.Unlock()
 }
 
 func (h *dnsHijacker) logProgressMaybe() {
@@ -285,6 +315,11 @@ func (h *dnsHijacker) HandleConnection(ctx context.Context, conn net.Conn, metad
 
 func (h *dnsHijacker) exchange(ctx context.Context, destination M.Socksaddr, request []byte) ([]byte, error) {
 	queryDomain, queryType := extractDNSQueryMeta(request)
+	if filtered, reason := h.shouldReplyEmptyByEgressFamily(queryDomain, queryType); filtered {
+		logrus.Debugf("[Client] dns hijack family filter: domain=%s type=%d reason=%s", queryDomain, queryType, reason)
+		atomic.AddUint64(&h.familyFiltered, 1)
+		return buildEmptyDNSNoAnswerResponse(request)
+	}
 	if h.shouldReplyEmptyAAAA(queryDomain, queryType) {
 		h.logAAAABypassMaybe(queryDomain)
 		return buildEmptyDNSNoAnswerResponse(request)
@@ -352,6 +387,11 @@ func (h *dnsHijacker) exchange(ctx context.Context, destination M.Socksaddr, req
 
 func (h *dnsHijacker) exchangeTCP(ctx context.Context, destination M.Socksaddr, request []byte) ([]byte, error) {
 	queryDomain, queryType := extractDNSQueryMeta(request)
+	if filtered, reason := h.shouldReplyEmptyByEgressFamily(queryDomain, queryType); filtered {
+		logrus.Debugf("[Client] dns hijack family filter(tcp): domain=%s type=%d reason=%s", queryDomain, queryType, reason)
+		atomic.AddUint64(&h.familyFiltered, 1)
+		return buildEmptyDNSNoAnswerResponse(request)
+	}
 	if h.shouldReplyEmptyAAAA(queryDomain, queryType) {
 		h.logAAAABypassMaybe(queryDomain)
 		return buildEmptyDNSNoAnswerResponse(request)
@@ -408,7 +448,7 @@ func (h *dnsHijacker) buildTargets(destination M.Socksaddr) []string {
 	if destination.IsValid() && destination.Port == 53 {
 		dest := destination.String()
 		if host, _, err := net.SplitHostPort(dest); err == nil {
-			if !isLoopbackOrUnspecifiedHost(host) {
+			if !isDisallowedDNSUpstreamHost(host) {
 				targets = append(targets, dest)
 			}
 		} else {
@@ -904,6 +944,41 @@ func (h *dnsHijacker) shouldReplyEmptyAAAA(domain string, queryType dnsmessage.T
 	return h.shouldUseDoHOnly(domain)
 }
 
+func (h *dnsHijacker) shouldReplyEmptyByEgressFamily(domain string, queryType dnsmessage.Type) (bool, string) {
+	if h == nil {
+		return false, ""
+	}
+	if queryType != dnsmessage.TypeA && queryType != dnsmessage.TypeAAAA {
+		return false, ""
+	}
+	domain = strings.TrimSpace(strings.ToLower(domain))
+	if domain == "" {
+		return false, ""
+	}
+	if strings.HasSuffix(domain, ".local") ||
+		strings.HasSuffix(domain, ".lan") ||
+		strings.HasSuffix(domain, ".home.arpa") ||
+		strings.HasSuffix(domain, ".in-addr.arpa") ||
+		strings.HasSuffix(domain, ".ip6.arpa") {
+		return false, ""
+	}
+	h.mu.Lock()
+	resolver := h.resolveDomainFamily
+	h.mu.Unlock()
+	if resolver == nil {
+		return false, ""
+	}
+	family := resolver(domain)
+	switch {
+	case family == nodeEgressFamilyIPv6 && queryType == dnsmessage.TypeA:
+		return true, "egress-ipv6-block-a"
+	case family == nodeEgressFamilyIPv4 && queryType == dnsmessage.TypeAAAA:
+		return true, "egress-ipv4-block-aaaa"
+	default:
+		return false, ""
+	}
+}
+
 func (h *dnsHijacker) logAAAABypassMaybe(domain string) {
 	if h == nil {
 		return
@@ -926,9 +1001,6 @@ func (h *dnsHijacker) shouldUseDoHOnly(domain string) bool {
 	if h == nil {
 		return false
 	}
-	if !h.openwrt {
-		return false
-	}
 	domain = strings.TrimSpace(strings.ToLower(domain))
 	if domain == "" {
 		return false
@@ -940,11 +1012,19 @@ func (h *dnsHijacker) shouldUseDoHOnly(domain string) bool {
 		strings.HasSuffix(domain, ".ip6.arpa") {
 		return false
 	}
-	// Keep domestic/private suffixes on plain DNS fallback to reduce breakage.
-	if strings.HasSuffix(domain, ".cn") {
-		return false
+	if h.openwrt {
+		// Keep domestic/private suffixes on plain DNS fallback to reduce breakage.
+		if strings.HasSuffix(domain, ".cn") {
+			return false
+		}
+		return true
 	}
-	return true
+	if h.darwinPublicDoHOnly {
+		// On macOS, system DNS path may bypass TUN intermittently and cause
+		// certificate mismatch; force public-domain DoH to stabilize family/path.
+		return true
+	}
+	return false
 }
 
 func dedupStringList(in []string) []string {
@@ -1112,6 +1192,30 @@ func isDNSTimeoutLikeError(err error) bool {
 func defaultDoHUpstreams() []dnsDoHUpstream {
 	return []dnsDoHUpstream{
 		{
+			Name:    "cloudflare-v6",
+			Addr:    "[2606:4700:4700::1111]:443",
+			Server:  "cloudflare-dns.com",
+			Host:    "cloudflare-dns.com",
+			URL:     "https://cloudflare-dns.com/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
+			Name:    "google-v6",
+			Addr:    "[2001:4860:4860::8888]:443",
+			Server:  "dns.google",
+			Host:    "dns.google",
+			URL:     "https://dns.google/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
+			Name:    "quad9-v6",
+			Addr:    "[2620:fe::fe]:443",
+			Server:  "dns.quad9.net",
+			Host:    "dns.quad9.net",
+			URL:     "https://dns.quad9.net/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
 			Name:    "cloudflare",
 			Addr:    "1.1.1.1:443",
 			Server:  "cloudflare-dns.com",
@@ -1166,8 +1270,8 @@ func discoverSystemDNSServers() []string {
 		if ip == nil {
 			continue
 		}
-		// Avoid self-recursive local resolvers in hijack path (127.0.0.1 / ::1 / 0.0.0.0 / ::).
-		if ip.IsLoopback() || ip.IsUnspecified() {
+		// Avoid self-recursive local resolvers and TUN-reserved/test ranges.
+		if isDisallowedDNSUpstreamIP(ip) {
 			continue
 		}
 		out = append(out, net.JoinHostPort(host, "53"))
@@ -1175,7 +1279,7 @@ func discoverSystemDNSServers() []string {
 	return dedupStringList(out)
 }
 
-func isLoopbackOrUnspecifiedHost(host string) bool {
+func isDisallowedDNSUpstreamHost(host string) bool {
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
 	if host == "" {
 		return false
@@ -1184,5 +1288,26 @@ func isLoopbackOrUnspecifiedHost(host string) bool {
 	if ip == nil {
 		return false
 	}
-	return ip.IsLoopback() || ip.IsUnspecified()
+	return isDisallowedDNSUpstreamIP(ip)
+}
+
+func isDisallowedDNSUpstreamIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalMulticast() || ip.IsLinkLocalUnicast() {
+		return true
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, prefix := range dnsDisallowedUpstreamPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

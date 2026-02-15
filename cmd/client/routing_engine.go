@@ -100,6 +100,7 @@ type routingEngine struct {
 	rules              []compiledRouteRule
 	groupEgress        map[string]string
 	defaultAction      routeAction
+	ipv6EgressStrict   bool
 	mitmHosts          []string
 	mitmURLRejectRegex []*regexp.Regexp
 }
@@ -240,6 +241,7 @@ func buildRoutingEngineWithOptions(ctx context.Context, cfg *clientRoutingConfig
 		rules:              make([]compiledRouteRule, 0, len(cfg.Rules)),
 		groupEgress:        normalizeRoutingGroupEgress(cfg.GroupEgress),
 		defaultAction:      defaultAction,
+		ipv6EgressStrict:   routingIPv6EgressStrictEnabled(cfg),
 		mitmHosts:          mitmHosts,
 		mitmURLRejectRegex: mitmURLRejectRegex,
 	}
@@ -2648,15 +2650,16 @@ func decideRoutingWithDomainHintsAndIPHints(
 }
 
 type routingInbound struct {
-	manager       *runtimeClientManager
-	decide        func(M.Socksaddr, []string) routeDecision
-	prepareDirect func(M.Socksaddr) error
-	observe       func(network string, source, destination M.Socksaddr, decision routeDecision, hintedHosts []string)
-	handleDNS     func(context.Context, network.PacketConn, M.Metadata) error
-	handleDNSTCP  func(context.Context, net.Conn, M.Metadata) error
-	handleDoHDoT  func(context.Context, net.Conn, M.Metadata, []string) (bool, error)
-	handleHTTPS   func(context.Context, net.Conn, M.Metadata, []string) (bool, error)
-	handleQUIC    func(context.Context, network.PacketConn, M.Metadata) (bool, error)
+	manager                *runtimeClientManager
+	decide                 func(M.Socksaddr, []string) routeDecision
+	resolveNodeDestination func(nodeName string, destination M.Socksaddr, hintedHosts []string, isUDP bool) (M.Socksaddr, error)
+	prepareDirect          func(M.Socksaddr) error
+	observe                func(network string, source, destination M.Socksaddr, decision routeDecision, hintedHosts []string)
+	handleDNS              func(context.Context, network.PacketConn, M.Metadata) error
+	handleDNSTCP           func(context.Context, net.Conn, M.Metadata) error
+	handleDoHDoT           func(context.Context, net.Conn, M.Metadata, []string) (bool, error)
+	handleHTTPS            func(context.Context, net.Conn, M.Metadata, []string) (bool, error)
+	handleQUIC             func(context.Context, network.PacketConn, M.Metadata) (bool, error)
 }
 
 func newRoutingInbound(manager *runtimeClientManager, engine *routingEngine, mitm *mitmRuntime) *routingInbound {
@@ -2665,6 +2668,7 @@ func newRoutingInbound(manager *runtimeClientManager, engine *routingEngine, mit
 		decide: func(destination M.Socksaddr, hintedHosts []string) routeDecision {
 			return decideRoutingWithDomainHints(engine, destination, manager.CurrentNodeName(), hintedHosts)
 		},
+		resolveNodeDestination: nil,
 	}
 	if mitm != nil {
 		inbound.handleHTTPS = func(ctx context.Context, conn net.Conn, metadata M.Metadata, hintedHosts []string) (bool, error) {
@@ -2689,6 +2693,7 @@ func newRoutingInbound(manager *runtimeClientManager, engine *routingEngine, mit
 func newDynamicRoutingInbound(
 	manager *runtimeClientManager,
 	decide func(M.Socksaddr, []string) routeDecision,
+	resolveNodeDestination func(nodeName string, destination M.Socksaddr, hintedHosts []string, isUDP bool) (M.Socksaddr, error),
 	prepareDirect func(M.Socksaddr) error,
 	observe func(network string, source, destination M.Socksaddr, decision routeDecision, hintedHosts []string),
 	handleDNS func(context.Context, network.PacketConn, M.Metadata) error,
@@ -2698,15 +2703,16 @@ func newDynamicRoutingInbound(
 	handleQUIC func(context.Context, network.PacketConn, M.Metadata) (bool, error),
 ) *routingInbound {
 	return &routingInbound{
-		manager:       manager,
-		decide:        decide,
-		prepareDirect: prepareDirect,
-		observe:       observe,
-		handleDNS:     handleDNS,
-		handleDNSTCP:  handleDNSTCP,
-		handleDoHDoT:  handleDoHDoT,
-		handleHTTPS:   handleHTTPS,
-		handleQUIC:    handleQUIC,
+		manager:                manager,
+		decide:                 decide,
+		resolveNodeDestination: resolveNodeDestination,
+		prepareDirect:          prepareDirect,
+		observe:                observe,
+		handleDNS:              handleDNS,
+		handleDNSTCP:           handleDNSTCP,
+		handleDoHDoT:           handleDoHDoT,
+		handleHTTPS:            handleHTTPS,
+		handleQUIC:             handleQUIC,
 	}
 }
 
@@ -2732,6 +2738,25 @@ func newStateRoutingInbound(state *apiState) *routingInbound {
 				dnsMap.Record(extraHints[0], []netip.Addr{destination.Addr.Unmap()}, 10*time.Minute)
 			}
 			return decideRoutingWithDomainHintsAndIPHints(engine, destination, defaultNode, hints, ipHints)
+		},
+		func(nodeName string, destination M.Socksaddr, hintedHosts []string, isUDP bool) (M.Socksaddr, error) {
+			nodeName = strings.TrimSpace(nodeName)
+			if nodeName == "" {
+				return destination, nil
+			}
+			node, ok := state.manager.Node(nodeName)
+			if !ok {
+				return destination, nil
+			}
+			state.lock.Lock()
+			dnsMap := state.dnsMap
+			engine := state.routing
+			state.lock.Unlock()
+			strictIPv6 := true
+			if engine != nil {
+				strictIPv6 = engine.ipv6EgressStrict
+			}
+			return resolveDestinationForNodeEgressFamilyWithMode(node, destination, hintedHosts, dnsMap, defaultResolveHostByFamily, strictIPv6, isUDP)
 		},
 		func(destination M.Socksaddr) error {
 			state.lock.Lock()
@@ -2881,7 +2906,20 @@ func (h *routingInbound) NewConnection(ctx context.Context, conn net.Conn, metad
 		if err != nil {
 			return err
 		}
-		return client.NewConnection(ctx, conn, metadata)
+		proxyDestination := metadata.Destination
+		if h.resolveNodeDestination != nil {
+			resolvedDestination, resolveErr := h.resolveNodeDestination(nodeName, proxyDestination, hintedHosts, false)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			proxyDestination = resolvedDestination
+		}
+		proxyC, err := client.CreateProxy(ctx, proxyDestination)
+		if err != nil {
+			return err
+		}
+		defer proxyC.Close()
+		return bufio.CopyConn(ctx, conn, proxyC)
 	case routeActionGroup:
 		return fmt.Errorf("unresolved routing group action: %s", decision.action.group)
 	default:
@@ -2922,13 +2960,21 @@ func (h *routingInbound) NewPacketConnection(ctx context.Context, conn network.P
 		if err != nil {
 			return err
 		}
+		proxyDestination := metadata.Destination
+		if h.resolveNodeDestination != nil {
+			resolvedDestination, resolveErr := h.resolveNodeDestination(nodeName, proxyDestination, nil, true)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			proxyDestination = resolvedDestination
+		}
 		proxyC, err := client.CreateProxy(ctx, uot.RequestDestination(2))
 		if err != nil {
 			return err
 		}
 		defer proxyC.Close()
 		request := uot.Request{
-			Destination: metadata.Destination,
+			Destination: proxyDestination,
 		}
 		uotC := uot.NewLazyConn(proxyC, request)
 		return bufio.CopyPacketConn(ctx, conn, uotC)
@@ -2936,5 +2982,239 @@ func (h *routingInbound) NewPacketConnection(ctx context.Context, conn network.P
 		return fmt.Errorf("unresolved routing group action: %s", decision.action.group)
 	default:
 		return fmt.Errorf("unsupported route action")
+	}
+}
+
+type nodeEgressIPFamily uint8
+
+const (
+	nodeEgressFamilyAny nodeEgressIPFamily = iota
+	nodeEgressFamilyIPv4
+	nodeEgressFamilyIPv6
+)
+
+type hostFamilyResolver func(host string, family nodeEgressIPFamily) ([]netip.Addr, error)
+
+func resolveDestinationForNodeEgressFamily(node clientNodeConfig, destination M.Socksaddr, hintedHosts []string, dnsMap *dnsDomainMap) (M.Socksaddr, error) {
+	return resolveDestinationForNodeEgressFamilyWithMode(node, destination, hintedHosts, dnsMap, defaultResolveHostByFamily, false, false)
+}
+
+func resolveDestinationForNodeEgressFamilyWithResolver(
+	node clientNodeConfig,
+	destination M.Socksaddr,
+	hintedHosts []string,
+	dnsMap *dnsDomainMap,
+	resolver hostFamilyResolver,
+) (M.Socksaddr, error) {
+	return resolveDestinationForNodeEgressFamilyWithMode(node, destination, hintedHosts, dnsMap, resolver, false, false)
+}
+
+func resolveDestinationForNodeEgressFamilyWithMode(
+	node clientNodeConfig,
+	destination M.Socksaddr,
+	hintedHosts []string,
+	dnsMap *dnsDomainMap,
+	resolver hostFamilyResolver,
+	strictIPv6 bool,
+	isUDP bool,
+) (M.Socksaddr, error) {
+	family := detectNodeEgressIPFamily(node)
+	if family == nodeEgressFamilyAny || !destination.IsValid() {
+		return destination, nil
+	}
+	if destination.IsFqdn() {
+		// Keep FQDN for server-side resolution to avoid CDN edge drift and SNI/Host mismatch.
+		return destination, nil
+	}
+	if !destination.IsIP() {
+		return destination, nil
+	}
+
+	dstIP := destination.Addr.Unmap()
+	if detectAddrFamily(dstIP) == family {
+		return destination, nil
+	}
+
+	hosts := appendUniqueHosts(nil, hintedHosts...)
+	if dnsMap != nil {
+		hosts = appendUniqueHosts(hosts, dnsMap.LookupByIP(dstIP.String())...)
+	}
+	for _, host := range hosts {
+		host = normalizeHost(host)
+		if host == "" || net.ParseIP(host) != nil {
+			continue
+		}
+		return M.Socksaddr{
+			Fqdn: host,
+			Port: destination.Port,
+		}, nil
+	}
+	if strictIPv6 && family == nodeEgressFamilyIPv6 {
+		nodeName := strings.TrimSpace(node.Name)
+		if nodeName == "" {
+			nodeName = "<unknown>"
+		}
+		if isUDP {
+			return destination, fmt.Errorf("%w: udp destination %s is IPv4 but node %s egress_ip=%s is IPv6 and no domain hint is available; block UDP to force TCP/SNI fallback", errRouteRejected, destination.String(), nodeName, strings.TrimSpace(node.EgressIP))
+		}
+		return destination, fmt.Errorf("destination %s is IPv4 but node %s egress_ip=%s is IPv6 and no domain hint is available", destination.String(), nodeName, strings.TrimSpace(node.EgressIP))
+	}
+	return destination, nil
+}
+
+func resolveDestinationByDomainFamily(
+	node clientNodeConfig,
+	destination M.Socksaddr,
+	rawHost string,
+	family nodeEgressIPFamily,
+	dnsMap *dnsDomainMap,
+	resolver hostFamilyResolver,
+	allowFallbackAnyFamily bool,
+) (M.Socksaddr, error) {
+	host := normalizeHost(rawHost)
+	if host == "" {
+		return destination, fmt.Errorf("empty host for node %s family resolution", strings.TrimSpace(node.Name))
+	}
+	if net.ParseIP(host) != nil {
+		return destination, fmt.Errorf("host %s is ip literal, cannot re-resolve by family", host)
+	}
+
+	candidates := make([]netip.Addr, 0, 8)
+	if dnsMap != nil {
+		candidates = append(candidates, filterAddrsByFamily(dnsMap.LookupByDomain(host), family)...)
+	}
+	if len(candidates) == 0 {
+		resolved, err := resolver(host, family)
+		if err != nil {
+			if !allowFallbackAnyFamily {
+				return destination, err
+			}
+		} else {
+			candidates = append(candidates, filterAddrsByFamily(resolved, family)...)
+			if dnsMap != nil && len(candidates) > 0 {
+				dnsMap.Record(host, candidates, 10*time.Minute)
+			}
+		}
+	}
+	if len(candidates) == 0 && allowFallbackAnyFamily {
+		if dnsMap != nil {
+			candidates = append(candidates, filterAddrsByFamily(dnsMap.LookupByDomain(host), nodeEgressFamilyAny)...)
+		}
+		if len(candidates) == 0 {
+			resolvedAny, anyErr := resolver(host, nodeEgressFamilyAny)
+			if anyErr != nil {
+				return destination, anyErr
+			}
+			candidates = append(candidates, filterAddrsByFamily(resolvedAny, nodeEgressFamilyAny)...)
+			if dnsMap != nil && len(candidates) > 0 {
+				dnsMap.Record(host, candidates, 10*time.Minute)
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return destination, fmt.Errorf("resolve %s got no %s address for node %s egress_ip=%s", host, family.String(), strings.TrimSpace(node.Name), strings.TrimSpace(node.EgressIP))
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].String() < candidates[j].String()
+	})
+	return M.Socksaddr{
+		Addr: candidates[0].Unmap(),
+		Port: destination.Port,
+	}, nil
+}
+
+func detectNodeEgressIPFamily(node clientNodeConfig) nodeEgressIPFamily {
+	egressIP := strings.TrimSpace(node.EgressIP)
+	if egressIP == "" {
+		return nodeEgressFamilyAny
+	}
+	ip := net.ParseIP(egressIP)
+	if ip == nil {
+		return nodeEgressFamilyAny
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return nodeEgressFamilyIPv4
+	}
+	return nodeEgressFamilyIPv6
+}
+
+func detectAddrFamily(addr netip.Addr) nodeEgressIPFamily {
+	if !addr.IsValid() {
+		return nodeEgressFamilyAny
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		return nodeEgressFamilyIPv4
+	}
+	if addr.Is6() {
+		return nodeEgressFamilyIPv6
+	}
+	return nodeEgressFamilyAny
+}
+
+func filterAddrsByFamily(addrs []netip.Addr, family nodeEgressIPFamily) []netip.Addr {
+	if len(addrs) == 0 {
+		return nil
+	}
+	out := make([]netip.Addr, 0, len(addrs))
+	seen := make(map[string]struct{}, len(addrs))
+	for _, addr := range addrs {
+		if !addr.IsValid() {
+			continue
+		}
+		addr = addr.Unmap()
+		if family != nodeEgressFamilyAny && detectAddrFamily(addr) != family {
+			continue
+		}
+		key := addr.String()
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, addr)
+	}
+	return out
+}
+
+func defaultResolveHostByFamily(host string, family nodeEgressIPFamily) ([]netip.Addr, error) {
+	host = normalizeHost(host)
+	if host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+	forceIPv4 := family == nodeEgressFamilyIPv4
+	ips, err := resolveHostByProbeUpstreams(host, 2*time.Second, forceIPv4)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s by upstreams failed: %w", host, err)
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, raw := range ips {
+		ipText := strings.TrimSpace(strings.Trim(raw, "[]"))
+		if ipText == "" {
+			continue
+		}
+		addr, parseErr := netip.ParseAddr(ipText)
+		if parseErr != nil || !addr.IsValid() {
+			continue
+		}
+		out = append(out, addr.Unmap())
+	}
+	out = filterAddrsByFamily(out, family)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("resolve %s got no %s address", host, family.String())
+	}
+	return out, nil
+}
+
+func (f nodeEgressIPFamily) String() string {
+	switch f {
+	case nodeEgressFamilyIPv4:
+		return "IPv4"
+	case nodeEgressFamilyIPv6:
+		return "IPv6"
+	default:
+		return "IP"
 	}
 }

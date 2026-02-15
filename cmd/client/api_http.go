@@ -1,6 +1,8 @@
 package main
 
 import (
+	"anytls/proxy/nodeopts"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/subtle"
@@ -347,6 +349,37 @@ func runWithAPI(ctx context.Context, configPath, listenFlag string, minIdleFlag 
 	go state.tunTaskGuardLoop(guardCtx)
 	state.recordRouteSelfHealEvent("info", "api_start", "API runtime initialized")
 	state.dnsHijacker = newDNSHijacker(state.dnsMap, cfg.Listen)
+	state.dnsHijacker.SetDomainFamilyResolver(func(domain string) nodeEgressIPFamily {
+		domain = normalizeHost(domain)
+		if domain == "" {
+			return nodeEgressFamilyAny
+		}
+		state.lock.Lock()
+		engine := state.routing
+		nodes := append([]clientNodeConfig(nil), state.cfg.Nodes...)
+		strict := routingIPv6EgressStrictEnabled(state.cfg.Routing)
+		defaultNode := state.manager.CurrentNodeName()
+		state.lock.Unlock()
+		if !strict || engine == nil || !engine.enabled {
+			return nodeEgressFamilyAny
+		}
+		decision := decideRoutingWithDomainHints(engine, M.Socksaddr{
+			Fqdn: domain,
+			Port: 443,
+		}, defaultNode, nil)
+		if decision.action.kind != routeActionNode {
+			return nodeEgressFamilyAny
+		}
+		nodeName := strings.TrimSpace(decision.action.node)
+		if nodeName == "" {
+			return nodeEgressFamilyAny
+		}
+		node, ok := findNodeByName(nodes, nodeName)
+		if !ok {
+			return nodeEgressFamilyAny
+		}
+		return detectNodeEgressIPFamily(node)
+	})
 	setTunBypassRecoverHook(state.tryRecoverNodeBypass)
 	setTunBypassActiveHook(state.isTunBypassRecoverActive)
 	defer setTunBypassRecoverHook(nil)
@@ -505,6 +538,7 @@ func startHTTPAPIServer(addr string, state *apiState) error {
 	mux.HandleFunc("/api/v1/config/rollback", requireAuth(state.handleConfigRollback))
 	mux.HandleFunc("/api/v1/test/latency", requireAuth(state.handleTestLatency))
 	mux.HandleFunc("/api/v1/test/bandwidth", requireAuth(state.handleTestBandwidth))
+	mux.HandleFunc("/api/v1/test/browser", requireAuth(state.handleTestBrowserAvailability))
 	mux.HandleFunc("/api/v1/diagnose", requireAuth(state.handleDiagnose))
 	mux.HandleFunc("/api/v1/route/check", requireAuth(state.handleRouteCheck))
 	mux.HandleFunc("/api/v1/route/selfheal", requireAuth(state.handleRouteSelfHeal))
@@ -516,6 +550,7 @@ func startHTTPAPIServer(addr string, state *apiState) error {
 	mux.HandleFunc("/api/v1/routing/egress_probe", requireAuth(state.handleRoutingEgressProbe))
 	mux.HandleFunc("/api/v1/routing/hits", requireAuth(state.handleRoutingHits))
 	mux.HandleFunc("/api/v1/routing/hits/clear", requireAuth(state.handleRoutingHitsClear))
+	mux.HandleFunc("/api/v1/routing/dns_map/clear", requireAuth(state.handleRoutingDNSMapClear))
 	mux.HandleFunc("/api/v1/mitm/ca", requireAuth(state.handleMITMCA))
 	mux.HandleFunc("/api/v1/mitm/ca/status", requireAuth(state.handleMITMCAStatus))
 	mux.HandleFunc("/api/v1/mitm/ca/install", requireAuth(state.handleMITMCAInstall))
@@ -1574,8 +1609,9 @@ func (s *apiState) handleTask(w http.ResponseWriter, r *http.Request) {
 		})
 	case http.MethodPost:
 		var req struct {
-			Kind string `json:"kind"`
-			ID   string `json:"id"`
+			Kind             string `json:"kind"`
+			ID               string `json:"id"`
+			ForceCurrentNode bool   `json:"force_current_node"`
 		}
 		if err := decodeJSONBody(r, &req); err != nil && err != io.EOF {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -1590,7 +1626,7 @@ func (s *apiState) handleTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		taskID := s.createTask(kind, "queued")
-		go s.runGenericTask(taskID, kind, targetID)
+		go s.runGenericTask(taskID, kind, targetID, req.ForceCurrentNode)
 		writeJSON(w, http.StatusAccepted, map[string]any{
 			"task_id": taskID,
 			"task": map[string]any{
@@ -1604,7 +1640,7 @@ func (s *apiState) handleTask(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *apiState) runGenericTask(taskID, kind, targetID string) {
+func (s *apiState) runGenericTask(taskID, kind, targetID string, forceCurrentNode bool) {
 	if shouldWaitTunPriorityForTask(kind) {
 		s.setTaskMessage(taskID, "waiting tun priority")
 		if err := s.waitTunPriorityWindow(tunPriorityWaitTimeout); err != nil {
@@ -1638,7 +1674,9 @@ func (s *apiState) runGenericTask(taskID, kind, targetID string) {
 		}
 		s.completeTask(taskID, res, nil, "subscription_update done")
 	case "tun_check":
-		res, err := s.runTunCheckTask(taskID)
+		res, err := s.runTunCheckTask(taskID, tunCheckTaskOptions{
+			ForceCurrentNode: forceCurrentNode,
+		})
 		if err != nil {
 			payload := map[string]any{
 				"time": time.Now().Format(time.RFC3339),
@@ -1783,7 +1821,11 @@ func (s *apiState) buildTunPriorityTimeoutPayload(kind string, waitErr error) ma
 	}
 }
 
-func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
+type tunCheckTaskOptions struct {
+	ForceCurrentNode bool
+}
+
+func (s *apiState) runTunCheckTask(taskID string, options tunCheckTaskOptions) (map[string]any, error) {
 	type taskStep struct {
 		Name       string `json:"name"`
 		Message    string `json:"message"`
@@ -1971,11 +2013,16 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 	issueSet := make(map[string]struct{})
 	extras := make(map[string]any)
 	currentNode := ""
+	dnsRuntimeProbeHosts := make([]string, 0, 4)
+	dnsRuntimeDegraded := false
+	dnsRuntimeDarwinZeroQuery := false
+	dnsRuntimeDegradedReason := ""
 	var (
-		statusRes   map[string]any
-		diagnoseRes map[string]any
-		routeRes    map[string]any
-		selfHealRes map[string]any
+		statusRes            map[string]any
+		diagnoseRes          map[string]any
+		routeRes             map[string]any
+		selfHealRes          map[string]any
+		localDNSCertProbeRes map[string]any
 	)
 
 	emitProgress = func() {
@@ -2031,6 +2078,82 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 				issues = appendIssue(issues, issueSet, fmt.Sprintf("节点旁路失败目标: %d", asInt(bypassMap["node_failed"])))
 			}
 		}
+		tunEnabled := false
+		tunRunning := false
+		if tunMap, ok := statusRes["tun"].(map[string]any); ok {
+			tunEnabled = asBool(tunMap["enabled"])
+			tunRunning = asBool(tunMap["running"])
+		}
+		if routingMap, ok := statusRes["routing"].(map[string]any); ok {
+			dnsUpstreamCount := asInt(routingMap["dns_upstream_count"])
+			dnsQuerySuccess := asInt(routingMap["dns_query_success"])
+			dnsQueryFailure := asInt(routingMap["dns_query_failure"])
+			dnsQueryTotal := dnsQuerySuccess + dnsQueryFailure
+			dnsFailureRate := 0.0
+			if dnsQueryTotal > 0 {
+				dnsFailureRate = float64(dnsQueryFailure) / float64(dnsQueryTotal)
+			}
+			dnsRuntime := map[string]any{
+				"upstream_count": dnsUpstreamCount,
+				"query_total":    dnsQueryTotal,
+				"query_success":  dnsQuerySuccess,
+				"query_failure":  dnsQueryFailure,
+				"failure_rate":   dnsFailureRate,
+				"degraded":       false,
+				"reason":         "",
+			}
+			switch {
+			case runtime.GOOS == "darwin" &&
+				tunEnabled &&
+				tunRunning &&
+				dnsQueryTotal == 0:
+				dnsRuntimeDegraded = true
+				dnsRuntimeDarwinZeroQuery = true
+				dnsRuntimeDegradedReason = "dns query total is 0 while tun is running on darwin"
+			case dnsQueryTotal >= 4 && dnsQuerySuccess == 0 && dnsQueryFailure > 0:
+				dnsRuntimeDegraded = true
+				dnsRuntimeDegradedReason = fmt.Sprintf("dns query success=0 failure=%d", dnsQueryFailure)
+			case dnsQueryTotal >= 12 && dnsQueryFailure >= 6 && dnsQueryFailure >= dnsQuerySuccess*3:
+				dnsRuntimeDegraded = true
+				dnsRuntimeDegradedReason = fmt.Sprintf("dns failure ratio high: failure=%d success=%d", dnsQueryFailure, dnsQuerySuccess)
+			}
+			if dnsRuntimeDegraded {
+				dnsRuntime["degraded"] = true
+				dnsRuntime["reason"] = dnsRuntimeDegradedReason
+				dnsRuntimeProbeHosts = appendUniqueStrings(dnsRuntimeProbeHosts, "www.google.com", "www.cloudflare.com")
+				if !(runtime.GOOS == "darwin" && dnsQueryTotal == 0) {
+					issues = appendIssue(issues, issueSet, "DNS 运行态异常：劫持解析成功率过低，可能导致浏览器证书错配")
+				}
+			}
+			extras["dns_runtime"] = dnsRuntime
+		}
+	}
+	if dnsRuntimeDegraded {
+		if s.dnsHijacker != nil {
+			s.dnsHijacker.ResetUpstreamHealth("tun-check-dns-runtime-degraded")
+		}
+		if s.dnsMap != nil {
+			clearDomains := appendUniqueStrings(nil, dnsRuntimeProbeHosts...)
+			for _, host := range dnsRuntimeProbeHosts {
+				host = normalizeHost(host)
+				if host == "" {
+					continue
+				}
+				parts := strings.Split(host, ".")
+				if len(parts) < 2 {
+					continue
+				}
+				root := strings.Join(parts[len(parts)-2:], ".")
+				clearDomains = appendUniqueStrings(clearDomains, root)
+			}
+			removed := s.dnsMap.RemoveDomains(clearDomains)
+			extras["dns_runtime_selfheal"] = map[string]any{
+				"attempted": true,
+				"reason":    dnsRuntimeDegradedReason,
+				"domains":   clearDomains,
+				"removed":   removed,
+			}
+		}
 	}
 	probeGuard := computeProbeGuard(statusRes)
 	extras["probe_guard"] = map[string]any{
@@ -2045,6 +2168,9 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 		"fd_open":                 probeGuard.FDOpen,
 		"fd_limit":                probeGuard.FDLimit,
 		"fd_usage_percent":        probeGuard.FDUsagePercent,
+	}
+	extras["mode"] = map[string]any{
+		"force_current_node": options.ForceCurrentNode,
 	}
 	if probeGuard.HighPressure {
 		extras["probe_guard_note"] = fmt.Sprintf("检测到连接压力（level=%d score=%.2f），已自动降级部分探测范围与超时", probeGuard.Level, probeGuard.Score)
@@ -2102,7 +2228,17 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 		httpsTargets = []string{"https://www.google.com/generate_204"}
 		httpsTimeout = 2500 * time.Millisecond
 	}
-	httpsProbeRes, httpsProbeErr := runStep(&steps, "https_probe", "TUN 连通性测试: 校验 HTTPS 证书与主机名", func() (map[string]any, error) {
+	httpsProbeMessage := "TUN 连通性测试: 校验 HTTPS 证书与主机名"
+	if options.ForceCurrentNode {
+		httpsProbeMessage = "TUN 连通性测试: 校验 HTTPS 证书与主机名（强制当前节点）"
+	}
+	httpsProbeRes, httpsProbeErr := runStep(&steps, "https_probe", httpsProbeMessage, func() (map[string]any, error) {
+		if options.ForceCurrentNode {
+			if strings.TrimSpace(currentNode) == "" {
+				return nil, fmt.Errorf("current node is empty")
+			}
+			return s.runTunHTTPSProbeViaNode(currentNode, httpsTargets, httpsTimeout)
+		}
 		return s.runTunHTTPSProbe(httpsTargets, httpsTimeout)
 	})
 	if httpsProbeRes != nil {
@@ -2167,6 +2303,58 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 	if systemHTTPSProbeErr != nil {
 		issues = appendIssue(issues, issueSet, "系统 curl HTTPS 校验失败: "+systemHTTPSProbeErr.Error())
 	}
+	if dnsRuntimeDarwinZeroQuery {
+		systemOK := false
+		if summary, ok := systemHTTPSProbeRes["summary"].(map[string]any); ok {
+			systemOK = asBool(summary["ok"]) && asInt(summary["hostname_mismatch"]) == 0
+		}
+		httpsOK := false
+		if summary, ok := httpsProbeRes["summary"].(map[string]any); ok {
+			httpsOK = asBool(summary["ok"]) && asInt(summary["hostname_mismatch"]) == 0
+		}
+		if systemOK && httpsOK {
+			dnsRuntimeDegraded = false
+			dnsRuntimeProbeHosts = nil
+			if dnsRuntime, ok := extras["dns_runtime"].(map[string]any); ok {
+				dnsRuntime["degraded"] = false
+				dnsRuntime["reason"] = "darwin query_total=0 but https/system probes are healthy"
+			}
+			extras["dns_runtime_soft_failover"] = map[string]any{
+				"applied": true,
+				"reason":  "darwin_query_total_zero_but_https_ok",
+			}
+			issues = removeIssuesByPrefix(issues, issueSet, "DNS 运行态异常：")
+		} else {
+			issues = appendIssue(issues, issueSet, "DNS 运行态异常：macOS 下 DNS 查询未进入隧道（query_total=0），可能导致浏览器走系统 DNS 出现证书错配")
+		}
+	}
+	if len(dnsRuntimeProbeHosts) > 0 {
+		if probeGuard.SkipHeavyProbe {
+			runSkippedStep(&steps, "local_dns_cert_probe", "TUN 连通性测试: 校验本地 DNS 解析证书一致性", "pressure-guard skip heavy local dns cert probe")
+		} else {
+			localDNSCertProbeRes, localDNSCertProbeErr := runStep(&steps, "local_dns_cert_probe", "TUN 连通性测试: 校验本地 DNS 解析证书一致性", func() (map[string]any, error) {
+				probeHosts := dnsRuntimeProbeHosts
+				if probeGuard.ReducedProbe && len(probeHosts) > 1 {
+					probeHosts = probeHosts[:1]
+				}
+				return s.runTunLocalDNSCertificateProbe(probeHosts, 3*time.Second)
+			})
+			if localDNSCertProbeRes != nil {
+				extras["local_dns_cert_probe"] = localDNSCertProbeRes
+				if summary, ok := localDNSCertProbeRes["summary"].(map[string]any); ok {
+					if asInt(summary["hostname_mismatch"]) > 0 {
+						issues = appendIssue(issues, issueSet, fmt.Sprintf("本地 DNS 解析证书主机名不匹配: %d 个目标", asInt(summary["hostname_mismatch"])))
+					}
+					if asInt(summary["failed"]) > 0 {
+						issues = appendIssue(issues, issueSet, fmt.Sprintf("本地 DNS 解析证书校验失败: %d 个目标", asInt(summary["failed"])))
+					}
+				}
+			}
+			if localDNSCertProbeErr != nil {
+				issues = appendIssue(issues, issueSet, "本地 DNS 解析证书校验失败: "+localDNSCertProbeErr.Error())
+			}
+		}
+	}
 	if httpsSummary, okHTTPS := httpsProbeRes["summary"].(map[string]any); okHTTPS {
 		if sysSummary, okSys := systemHTTPSProbeRes["summary"].(map[string]any); okSys {
 			if asBool(httpsSummary["ok"]) && !asBool(sysSummary["ok"]) {
@@ -2199,6 +2387,7 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 	if s.dnsMap != nil {
 		quarantine := collectHostnameMismatchDomainIPBlocks(httpsProbeRes)
 		quarantine = mergeDomainIPQuarantine(quarantine, collectHostnameMismatchDomainIPBlocks(systemHTTPSProbeRes))
+		quarantine = mergeDomainIPQuarantine(quarantine, collectHostnameMismatchDomainIPBlocks(localDNSCertProbeRes))
 		quarantineHosts := make([]string, 0, len(quarantine))
 		for host := range quarantine {
 			quarantineHosts = append(quarantineHosts, host)
@@ -2251,6 +2440,9 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 	mismatchHosts = appendUniqueStrings(mismatchHosts, collectProbeFailedHosts(httpsProbeRes)...)
 	mismatchHosts = appendUniqueStrings(mismatchHosts, collectHostnameMismatchHosts(systemHTTPSProbeRes)...)
 	mismatchHosts = appendUniqueStrings(mismatchHosts, collectProbeFailedHosts(systemHTTPSProbeRes)...)
+	mismatchHosts = appendUniqueStrings(mismatchHosts, collectHostnameMismatchHosts(localDNSCertProbeRes)...)
+	mismatchHosts = appendUniqueStrings(mismatchHosts, collectProbeFailedHosts(localDNSCertProbeRes)...)
+	mismatchHosts = appendUniqueStrings(mismatchHosts, dnsRuntimeProbeHosts...)
 	if len(mismatchHosts) > 0 {
 		if probeGuard.SkipHeavyProbe {
 			runSkippedStep(&steps, "dns_resolution_probe", "TUN 连通性测试: 采样异常域名 DNS 解析", "pressure-guard skip heavy dns probe")
@@ -2275,6 +2467,13 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 			})
 			if dnsProbeRes != nil {
 				extras["dns_resolution_probe"] = dnsProbeRes
+				if dnsRuntimeDegraded {
+					if summary, ok := dnsProbeRes["summary"].(map[string]any); ok {
+						if asInt(summary["failed"]) > 0 {
+							issues = appendIssue(issues, issueSet, fmt.Sprintf("DNS 运行态异常且采样失败: %d 个探测项", asInt(summary["failed"])))
+						}
+					}
+				}
 			}
 			if dnsProbeErr != nil {
 				issues = appendIssue(issues, issueSet, "异常域名 DNS 采样失败: "+dnsProbeErr.Error())
@@ -2337,6 +2536,217 @@ func (s *apiState) runTunCheckTask(taskID string) (map[string]any, error) {
 			"total_steps":  len(steps),
 		},
 	}, nil
+}
+
+func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, timeout time.Duration) (map[string]any, error) {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	nodeName = strings.TrimSpace(nodeName)
+	if nodeName == "" {
+		return map[string]any{
+			"summary": map[string]any{
+				"ok":                false,
+				"total":             0,
+				"success":           0,
+				"failed":            0,
+				"hostname_mismatch": 0,
+			},
+			"results": []map[string]any{},
+		}, fmt.Errorf("current node is empty")
+	}
+	client, err := s.manager.ClientForNode(nodeName)
+	if err != nil {
+		return map[string]any{
+			"summary": map[string]any{
+				"ok":                false,
+				"total":             0,
+				"success":           0,
+				"failed":            0,
+				"hostname_mismatch": 0,
+			},
+			"results": []map[string]any{},
+		}, err
+	}
+
+	results := make([]map[string]any, 0, len(targets))
+	successCount := 0
+	mismatchCount := 0
+	failCount := 0
+	var firstErr error
+
+	for _, rawURL := range targets {
+		targetURL := strings.TrimSpace(rawURL)
+		if targetURL == "" {
+			continue
+		}
+		item := map[string]any{
+			"url":  targetURL,
+			"ok":   false,
+			"node": nodeName,
+		}
+		startAt := time.Now()
+		func() {
+			parsed, parseErr := neturl.Parse(targetURL)
+			if parseErr != nil {
+				item["error"] = fmt.Sprintf("invalid url: %v", parseErr)
+				failCount++
+				if firstErr == nil {
+					firstErr = parseErr
+				}
+				return
+			}
+			if !strings.EqualFold(strings.TrimSpace(parsed.Scheme), "https") {
+				err := fmt.Errorf("unsupported scheme: %s", strings.TrimSpace(parsed.Scheme))
+				item["error"] = err.Error()
+				failCount++
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+
+			host := strings.TrimSpace(parsed.Hostname())
+			item["host"] = host
+			port := strings.TrimSpace(parsed.Port())
+			if port == "" {
+				port = "443"
+			}
+			destination := M.ParseSocksaddr(net.JoinHostPort(host, port))
+			if !destination.IsValid() {
+				err := fmt.Errorf("invalid destination: %s", net.JoinHostPort(host, port))
+				item["error"] = err.Error()
+				failCount++
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+
+			probeTimeout := timeout
+			if probeTimeout < 4*time.Second {
+				probeTimeout = 4 * time.Second
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout+2*time.Second)
+			defer cancel()
+
+			conn, dialErr := client.CreateProxy(ctx, destination)
+			if dialErr != nil {
+				item["error"] = dialErr.Error()
+				failCount++
+				if firstErr == nil {
+					firstErr = dialErr
+				}
+				return
+			}
+			defer conn.Close()
+
+			_ = conn.SetDeadline(time.Now().Add(probeTimeout + 1200*time.Millisecond))
+			tlsConn := tls.Client(conn, &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				ServerName: host,
+				NextProtos: []string{"http/1.1"},
+			})
+			if handshakeErr := tlsConn.Handshake(); handshakeErr != nil {
+				if isHostnameMismatchError(handshakeErr) {
+					item["error_type"] = "hostname_mismatch"
+					mismatchCount++
+				} else {
+					failCount++
+				}
+				item["error"] = handshakeErr.Error()
+				if firstErr == nil {
+					firstErr = handshakeErr
+				}
+				return
+			}
+			state := tlsConn.ConnectionState()
+			if len(state.PeerCertificates) > 0 {
+				leaf := state.PeerCertificates[0]
+				item["cert_subject"] = strings.TrimSpace(leaf.Subject.CommonName)
+				if len(leaf.DNSNames) > 0 {
+					limit := len(leaf.DNSNames)
+					if limit > 8 {
+						limit = 8
+					}
+					item["cert_dns_names"] = append([]string(nil), leaf.DNSNames[:limit]...)
+				}
+			}
+
+			reqPath := strings.TrimSpace(parsed.EscapedPath())
+			if reqPath == "" {
+				reqPath = "/"
+			}
+			if strings.TrimSpace(parsed.RawQuery) != "" {
+				reqPath += "?" + strings.TrimSpace(parsed.RawQuery)
+			}
+			if _, writeErr := io.WriteString(tlsConn, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: anytls-tun-check/1.0\r\nConnection: close\r\n\r\n", reqPath, host)); writeErr != nil {
+				item["error"] = writeErr.Error()
+				failCount++
+				if firstErr == nil {
+					firstErr = writeErr
+				}
+				return
+			}
+			reader := bufio.NewReader(tlsConn)
+			statusLine, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				item["error"] = readErr.Error()
+				failCount++
+				if firstErr == nil {
+					firstErr = readErr
+				}
+				return
+			}
+			fields := strings.Fields(strings.TrimSpace(statusLine))
+			if len(fields) >= 2 {
+				if statusCode, convErr := strconv.Atoi(fields[1]); convErr == nil {
+					item["status_code"] = statusCode
+				}
+			}
+			item["ok"] = true
+			successCount++
+		}()
+		item["duration_ms"] = time.Since(startAt).Milliseconds()
+		results = append(results, item)
+	}
+
+	if len(results) == 0 {
+		return map[string]any{
+			"summary": map[string]any{
+				"ok":                false,
+				"total":             0,
+				"success":           0,
+				"failed":            0,
+				"hostname_mismatch": 0,
+			},
+			"results": results,
+		}, fmt.Errorf("no https probe target configured")
+	}
+	result := map[string]any{
+		"summary": map[string]any{
+			"ok":                mismatchCount == 0 && failCount == 0 && successCount > 0,
+			"total":             len(results),
+			"success":           successCount,
+			"failed":            failCount,
+			"hostname_mismatch": mismatchCount,
+			"node":              nodeName,
+		},
+		"results": results,
+	}
+	if mismatchCount > 0 {
+		return result, fmt.Errorf("detected certificate hostname mismatch on %d target(s)", mismatchCount)
+	}
+	if failCount > 0 {
+		return result, fmt.Errorf("https probe failed on %d target(s)", failCount)
+	}
+	if successCount == 0 {
+		if firstErr != nil {
+			return result, fmt.Errorf("all https probe targets failed: %v", firstErr)
+		}
+		return result, fmt.Errorf("all https probe targets failed")
+	}
+	return result, nil
 }
 
 func (s *apiState) runTunHTTPSProbe(targets []string, timeout time.Duration) (map[string]any, error) {
@@ -2644,6 +3054,45 @@ func (s *apiState) runTunSystemHTTPSProbeWithOptions(targets []string, timeoutSe
 			}
 		}
 	}
+	shouldTryDarwinDNSRepair := options.AutoDNSRepair &&
+		runtime.GOOS == "darwin" &&
+		eval.failCount > 0
+	if shouldTryDarwinDNSRepair && repairInfo == nil {
+		domains := buildDNSRepairTargetsForHosts(eval.failedHosts)
+		repairInfo = map[string]any{
+			"attempted": true,
+			"platform":  "darwin",
+			"domains":   appendUniqueStrings(nil, domains...),
+			"before": map[string]any{
+				"failed":            eval.failCount,
+				"hostname_mismatch": eval.mismatchCount,
+				"dns_path_unstable": eval.dnsPathFlaky,
+				"success":           eval.successCount,
+			},
+		}
+		_, changed, repErr := enforceDarwinSystemDNS(defaultDarwinManagedDNSServers())
+		if repErr != nil {
+			repairInfo["ok"] = false
+			repairInfo["error"] = repErr.Error()
+			repairInfo["config_changed"] = changed > 0
+		} else {
+			repairInfo["ok"] = true
+			repairInfo["config_changed"] = changed > 0
+		}
+		retryProbe := changed > 0 || repErr == nil
+		repairInfo["retry_probe"] = retryProbe
+		if retryProbe {
+			flushDarwinDNSCache()
+			retry := runTunSystemHTTPSProbeOnce(targets, timeoutSec, openwrtMode)
+			repairInfo["after"] = map[string]any{
+				"failed":            retry.failCount,
+				"hostname_mismatch": retry.mismatchCount,
+				"dns_path_unstable": retry.dnsPathFlaky,
+				"success":           retry.successCount,
+			}
+			eval = retry
+		}
+	}
 
 	hardFailCount := eval.failCount - eval.dnsPathFlaky
 	if hardFailCount < 0 {
@@ -2801,7 +3250,13 @@ func buildDNSRepairTargetsForHosts(hosts []string) []string {
 	return appendUniqueStrings(nil, targets...)
 }
 
+type systemCurlProbeTraceFunc func(step, detail string)
+
 func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode bool) error {
+	return runSystemCurlProbeCommandWithTrace(targetURL, timeoutSec, openwrtMode, nil)
+}
+
+func runSystemCurlProbeCommandWithTrace(targetURL string, timeoutSec int, openwrtMode bool, trace systemCurlProbeTraceFunc) error {
 	if timeoutSec <= 0 {
 		timeoutSec = 8
 	}
@@ -2818,6 +3273,7 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 			port = "80"
 		}
 	}
+	traceSystemCurlProbeStep(trace, "prepare", fmt.Sprintf("url=%s host=%s port=%s timeout_sec=%d openwrt=%t", targetURL, host, port, timeoutSec, openwrtMode))
 
 	baseArgs := []string{
 		"-q",
@@ -2826,7 +3282,7 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 		"--noproxy", "*",
 		"-o", "/dev/null",
 	}
-	runAttempt := func(ip string, attemptBudget time.Duration, connectCapSec int, forceIPv4 bool) error {
+	runAttempt := func(label, ip string, attemptBudget time.Duration, connectCapSec int, forceIPv4 bool) error {
 		if attemptBudget <= 0 {
 			attemptBudget = 2 * time.Second
 		}
@@ -2851,7 +3307,16 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 			args = append(args, "--resolve", fmt.Sprintf("%s:%s:%s", host, port, ip))
 		}
 		args = append(args, targetURL)
-		return runCurlProbeCommand(args, targetURL, attemptBudget+700*time.Millisecond)
+		traceSystemCurlProbeStep(trace, "attempt", fmt.Sprintf("label=%s force_ipv4=%t resolve_ip=%s budget_ms=%d connect_cap_sec=%d", label, forceIPv4, strings.TrimSpace(ip), attemptBudget.Milliseconds(), connectCapSec))
+		startAt := time.Now()
+		err := runCurlProbeCommand(args, targetURL, attemptBudget+700*time.Millisecond)
+		durMS := time.Since(startAt).Milliseconds()
+		if err != nil {
+			traceSystemCurlProbeStep(trace, "attempt_result", fmt.Sprintf("label=%s ok=false duration_ms=%d error=%v", label, durMS, err))
+			return err
+		}
+		traceSystemCurlProbeStep(trace, "attempt_result", fmt.Sprintf("label=%s ok=true duration_ms=%d", label, durMS))
+		return nil
 	}
 
 	totalBudget := time.Duration(timeoutSec) * time.Second
@@ -2865,8 +3330,9 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 	}
 
 	// First probe the real system path (without --resolve), so the result matches user-facing curl behavior.
-	plainErr := runAttempt("", plainBudget, 4, false)
+	plainErr := runAttempt("system_path", "", plainBudget, 4, false)
 	if plainErr == nil {
+		traceSystemCurlProbeStep(trace, "done", "success on primary system path")
 		return nil
 	}
 	if shouldRetrySystemCurlPath(plainErr) {
@@ -2876,8 +3342,9 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 			if retryBudget < 800*time.Millisecond {
 				retryBudget = remaining
 			}
-			retryErr := runAttempt("", retryBudget, 2, false)
+			retryErr := runAttempt("system_path_retry", "", retryBudget, 2, false)
 			if retryErr == nil {
+				traceSystemCurlProbeStep(trace, "done", "success on retry system path")
 				return nil
 			}
 			plainErr = retryErr
@@ -2892,8 +3359,9 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 			if v4Budget < 700*time.Millisecond {
 				v4Budget = remaining
 			}
-			v4Err := runAttempt("", v4Budget, 2, true)
+			v4Err := runAttempt("openwrt_ipv4_fallback", "", v4Budget, 2, true)
 			if v4Err == nil {
+				traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("system default stack failed but curl -4 succeeded: %v", plainErr))
 				return fmt.Errorf("system default stack failed: %v; curl -4 succeeded", plainErr)
 			}
 		}
@@ -2902,30 +3370,41 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 	// Optional fallback probe for diagnostics only; if fallback succeeds, we still report failure
 	// because system DNS path is broken.
 	if !(openwrtMode && host != "" && net.ParseIP(host) == nil && strings.EqualFold(parsed.Scheme, "https")) {
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("failed on system path: %v", plainErr))
 		return plainErr
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 500*time.Millisecond {
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("failed with no fallback budget: %v", plainErr))
 		return plainErr
 	}
 	resolveBudget := minDuration(remaining, 1500*time.Millisecond)
+	traceSystemCurlProbeStep(trace, "resolve_start", fmt.Sprintf("host=%s budget_ms=%d", host, resolveBudget.Milliseconds()))
 	resolvedIPs, resolveErr := resolveHostByProbeUpstreams(host, resolveBudget, true)
 	if resolveErr != nil || len(resolvedIPs) == 0 {
+		if resolveErr != nil {
+			traceSystemCurlProbeStep(trace, "resolve_result", fmt.Sprintf("ok=false error=%v", resolveErr))
+		} else {
+			traceSystemCurlProbeStep(trace, "resolve_result", "ok=false error=no ip resolved")
+		}
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("failed on system path: %v", plainErr))
 		return plainErr
 	}
 	candidates := appendUniqueStrings(nil, resolvedIPs...)
 	if len(candidates) > 1 {
 		candidates = candidates[:1]
 	}
+	traceSystemCurlProbeStep(trace, "resolve_result", fmt.Sprintf("ok=true candidates=%s", strings.Join(candidates, ",")))
 	remaining = time.Until(deadline)
 	if remaining <= 400*time.Millisecond {
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("failed with no fallback attempt budget: %v", plainErr))
 		return plainErr
 	}
 	fallbackBudget := minDuration(remaining, 1200*time.Millisecond)
 	fallbackSucceeded := false
 	var lastFallbackErr error
 	for _, ip := range candidates {
-		err := runAttempt(ip, fallbackBudget, 2, true)
+		err := runAttempt("resolved_fallback", ip, fallbackBudget, 2, true)
 		if err == nil {
 			fallbackSucceeded = true
 			break
@@ -2933,12 +3412,22 @@ func runSystemCurlProbeCommand(targetURL string, timeoutSec int, openwrtMode boo
 		lastFallbackErr = err
 	}
 	if fallbackSucceeded {
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("system dns path failed but resolved fallback succeeded: %v", plainErr))
 		return fmt.Errorf("system dns path failed: %v; resolved fallback succeeded", plainErr)
 	}
 	if lastFallbackErr != nil {
+		traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("system dns path failed and resolved fallback failed: %v", lastFallbackErr))
 		return fmt.Errorf("system dns path failed: %v; resolved fallback also failed: %v", plainErr, lastFallbackErr)
 	}
+	traceSystemCurlProbeStep(trace, "done", fmt.Sprintf("failed on system path: %v", plainErr))
 	return plainErr
+}
+
+func traceSystemCurlProbeStep(trace systemCurlProbeTraceFunc, step, detail string) {
+	if trace == nil {
+		return
+	}
+	trace(strings.TrimSpace(step), strings.TrimSpace(detail))
 }
 
 func shouldRetrySystemCurlPath(err error) bool {
@@ -3740,6 +4229,183 @@ func (s *apiState) runTunDNSResolutionProbe(hosts []string, servers []string, ti
 	return out, nil
 }
 
+func (s *apiState) runTunLocalDNSCertificateProbe(hosts []string, timeout time.Duration) (map[string]any, error) {
+	hosts = appendUniqueStrings(nil, hosts...)
+	if len(hosts) == 0 {
+		return map[string]any{
+			"summary": map[string]any{
+				"ok":                false,
+				"total":             0,
+				"success":           0,
+				"failed":            0,
+				"hostname_mismatch": 0,
+			},
+			"results": []map[string]any{},
+		}, fmt.Errorf("no host to probe")
+	}
+	if timeout <= 0 {
+		timeout = 3 * time.Second
+	}
+	dnsServer := "127.0.0.1:53"
+	results := make([]map[string]any, 0, len(hosts))
+	successCount := 0
+	failCount := 0
+	mismatchCount := 0
+	var firstErr error
+	attempts := 3
+	if runtime.GOOS != "darwin" {
+		attempts = 2
+	}
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	for _, rawHost := range hosts {
+		host := normalizeHost(rawHost)
+		if host == "" {
+			continue
+		}
+		targetURL := "https://" + host
+		switch host {
+		case "www.google.com":
+			targetURL = "https://www.google.com/generate_204"
+		case "www.cloudflare.com":
+			targetURL = "https://www.cloudflare.com/cdn-cgi/trace"
+		}
+		row := map[string]any{
+			"host":       host,
+			"url":        targetURL,
+			"dns_server": dnsServer,
+			"ok":         false,
+			"attempts":   attempts,
+		}
+		startAt := time.Now()
+		roundRows := make([]map[string]any, 0, attempts)
+		hostFailed := false
+		hostMismatch := false
+		var hostErr error
+		for i := 0; i < attempts; i++ {
+			attemptStart := time.Now()
+			round := map[string]any{
+				"attempt": i + 1,
+			}
+			ips, network, err := lookupHostWithDNSServerPreferTCP(host, dnsServer, minDuration(timeout, 2*time.Second))
+			round["network"] = network
+			if err != nil {
+				round["ok"] = false
+				round["error"] = err.Error()
+				hostFailed = true
+				if hostErr == nil {
+					hostErr = err
+				}
+				round["duration_ms"] = time.Since(attemptStart).Milliseconds()
+				roundRows = append(roundRows, round)
+				continue
+			}
+			ips = appendUniqueStrings(nil, ips...)
+			if len(ips) > 4 {
+				ips = ips[:4]
+			}
+			if len(ips) == 0 {
+				err = fmt.Errorf("no ip returned")
+				round["ok"] = false
+				round["error"] = err.Error()
+				hostFailed = true
+				if hostErr == nil {
+					hostErr = err
+				}
+				round["duration_ms"] = time.Since(attemptStart).Milliseconds()
+				roundRows = append(roundRows, round)
+				continue
+			}
+			round["resolved_ips"] = ips
+
+			probeRes, probeErr := runHTTPSProbeViaResolvedIPs(targetURL, host, ips, timeout)
+			if probeErr != nil {
+				round["ok"] = false
+				round["error"] = probeErr.Error()
+				if isHostnameMismatchError(probeErr) {
+					round["error_type"] = "hostname_mismatch"
+					hostMismatch = true
+				} else {
+					hostFailed = true
+				}
+				if hostErr == nil {
+					hostErr = probeErr
+				}
+				round["duration_ms"] = time.Since(attemptStart).Milliseconds()
+				roundRows = append(roundRows, round)
+				continue
+			}
+			round["ok"] = true
+			round["status_code"] = probeRes.StatusCode
+			if strings.TrimSpace(probeRes.UsedIP) != "" {
+				round["resolved_ip"] = strings.TrimSpace(probeRes.UsedIP)
+			}
+			if strings.TrimSpace(probeRes.CertSubject) != "" {
+				round["cert_subject"] = strings.TrimSpace(probeRes.CertSubject)
+			}
+			if len(probeRes.CertDNSNames) > 0 {
+				round["cert_dns_names"] = append([]string(nil), probeRes.CertDNSNames...)
+			}
+			round["duration_ms"] = time.Since(attemptStart).Milliseconds()
+			roundRows = append(roundRows, round)
+		}
+		row["rounds"] = roundRows
+		if hostMismatch {
+			row["ok"] = false
+			row["error_type"] = "hostname_mismatch"
+			row["error"] = "hostname mismatch detected in multi-round local dns cert probe"
+			mismatchCount++
+			if firstErr == nil && hostErr != nil {
+				firstErr = hostErr
+			}
+		} else if hostFailed {
+			row["ok"] = false
+			if hostErr != nil {
+				row["error"] = hostErr.Error()
+				if firstErr == nil {
+					firstErr = hostErr
+				}
+			} else {
+				row["error"] = "local dns cert probe failed"
+			}
+			failCount++
+		} else {
+			row["ok"] = true
+			successCount++
+		}
+		row["duration_ms"] = time.Since(startAt).Milliseconds()
+		results = append(results, row)
+	}
+
+	summary := map[string]any{
+		"ok":                mismatchCount == 0 && failCount == 0 && successCount > 0,
+		"total":             len(results),
+		"success":           successCount,
+		"failed":            failCount,
+		"hostname_mismatch": mismatchCount,
+		"dns_server":        dnsServer,
+	}
+	result := map[string]any{
+		"summary": summary,
+		"results": results,
+	}
+	if mismatchCount > 0 {
+		return result, fmt.Errorf("local dns cert probe detected hostname mismatch on %d target(s)", mismatchCount)
+	}
+	if failCount > 0 {
+		return result, fmt.Errorf("local dns cert probe failed on %d target(s)", failCount)
+	}
+	if successCount == 0 {
+		if firstErr != nil {
+			return result, fmt.Errorf("local dns cert probe failed: %v", firstErr)
+		}
+		return result, fmt.Errorf("local dns cert probe failed")
+	}
+	return result, nil
+}
+
 func shouldFallbackUDPDNSProbe(server, tcpErr string) bool {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(server))
 	if err != nil {
@@ -4312,9 +4978,27 @@ func (s *apiState) handleNodeByName(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPut:
 		var req clientNodeConfig
-		if err := decodeJSONBody(r, &req); err != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		decoder := json.NewDecoder(bytes.NewReader(body))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		updateFields := make(map[string]struct{})
+		if len(body) > 0 {
+			raw := map[string]json.RawMessage{}
+			if err := json.Unmarshal(body, &raw); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			for key := range raw {
+				updateFields[strings.ToLower(strings.TrimSpace(key))] = struct{}{}
+			}
 		}
 
 		s.lock.Lock()
@@ -4331,7 +5015,8 @@ func (s *apiState) handleNodeByName(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if strings.TrimSpace(req.URI) != "" {
+		hasDirectField := nodeopts.HasDirectUpdateFields(updateFields)
+		if strings.TrimSpace(req.URI) != "" && !hasDirectField {
 			newName, err := upsertNodeFromURI(s.cfg, name, req.URI)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
@@ -4356,27 +5041,53 @@ func (s *apiState) handleNodeByName(w http.ResponseWriter, r *http.Request) {
 		}
 
 		node := s.cfg.Nodes[index]
-		if v := strings.TrimSpace(req.Server); v != "" {
-			node.Server = v
+		originalURI := strings.TrimSpace(node.URI)
+		rebuildAnyTLSURI := originalURI == "" || hasAnyTLSScheme(originalURI)
+		current := nodeopts.NodeData{
+			Server:        node.Server,
+			Password:      node.Password,
+			SNI:           node.SNI,
+			EgressIP:      node.EgressIP,
+			EgressRule:    node.EgressRule,
+			AllowInsecure: node.AllowInsecure,
+			CACertPath:    node.CACertPath,
+			Groups:        node.Groups,
 		}
-		if v := strings.TrimSpace(req.Password); v != "" {
-			node.Password = v
+		requested := nodeopts.NodeData{
+			Server:        req.Server,
+			Password:      req.Password,
+			SNI:           req.SNI,
+			EgressIP:      req.EgressIP,
+			EgressRule:    req.EgressRule,
+			AllowInsecure: req.AllowInsecure,
+			CACertPath:    req.CACertPath,
+			Groups:        req.Groups,
 		}
-		if v := strings.TrimSpace(req.SNI); v != "" {
-			node.SNI = v
-		}
-		if v := strings.TrimSpace(req.EgressIP); v != "" {
-			node.EgressIP = v
-		}
-		if v := strings.TrimSpace(req.EgressRule); v != "" {
-			node.EgressRule = v
-		}
-		if req.Groups != nil {
-			node.Groups = append([]string(nil), req.Groups...)
+		nodeopts.ApplyUpdateToNode(&current, requested, updateFields)
+		node.Server = current.Server
+		node.Password = current.Password
+		node.SNI = current.SNI
+		node.EgressIP = current.EgressIP
+		node.EgressRule = current.EgressRule
+		node.AllowInsecure = cloneBoolPtr(current.AllowInsecure)
+		node.CACertPath = current.CACertPath
+		node.Groups = append([]string(nil), current.Groups...)
+		// Avoid stale anytls URI query parameters (for example egress-ip) being backfilled
+		// into edited fields when user explicitly clears them.
+		if rebuildAnyTLSURI {
+			node.URI = ""
 		}
 		if err := normalizeNode(&node); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		if rebuildAnyTLSURI {
+			uri, err := buildAnyTLSURIFromNode(node)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			node.URI = uri
 		}
 		s.cfg.Nodes[index] = node
 		if err := saveClientConfig(s.configPath, s.cfg); err != nil {
@@ -4514,6 +5225,10 @@ func cloneRoutingConfig(in *clientRoutingConfig) *clientRoutingConfig {
 		return nil
 	}
 	out := *in
+	if in.IPv6EgressStrict != nil {
+		v := *in.IPv6EgressStrict
+		out.IPv6EgressStrict = &v
+	}
 	if len(in.Rules) > 0 {
 		out.Rules = append([]string(nil), in.Rules...)
 	}

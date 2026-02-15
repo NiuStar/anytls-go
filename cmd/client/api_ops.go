@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/proxy/nodeopts"
 	"anytls/util"
 	"crypto/sha256"
 	"crypto/x509"
@@ -457,6 +458,7 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 	failoverEnabled := cfg.Failover != nil && cfg.Failover.Enabled
 	failoverBestLatencyEnabled := cfg.Failover != nil && cfg.Failover.BestLatencyEnabled
 	routingEnabled := cfg.Routing != nil && cfg.Routing.Enabled
+	routingIPv6EgressStrict := routingIPv6EgressStrictEnabled(cfg.Routing)
 	routingRuleCount := 0
 	routingProviderCount := 0
 	dnsMapIPCount := 0
@@ -466,6 +468,7 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 	dnsQueriesTCP := uint64(0)
 	dnsQuerySuccess := uint64(0)
 	dnsQueryFailure := uint64(0)
+	dnsFamilyFiltered := uint64(0)
 	nodeBypass := s.nodeBypass
 	routingHitStore := s.routingHits
 	egressProbeLast := s.getRoutingEgressProbeLastLocked()
@@ -479,6 +482,7 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.dnsHijacker != nil {
 		dnsUpstreamCount = len(s.dnsHijacker.Upstreams())
 		dnsQueriesUDP, dnsQueriesTCP, dnsQuerySuccess, dnsQueryFailure = s.dnsHijacker.Snapshot()
+		dnsFamilyFiltered = s.dnsHijacker.FamilyFilteredCount()
 	}
 	started := s.startedAt
 	configPath := s.configPath
@@ -499,6 +503,10 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 	recentRoutingDestination := ""
 	recentRoutingNetwork := ""
 	recentRoutingSource := ""
+	liveHitsTotal60s := 0
+	liveHitsNode60s := 0
+	liveHitsDirect60s := 0
+	liveHitsReject60s := 0
 	if routingHitStore != nil {
 		if items := routingHitStore.list(1, "live", "", "", "", "", "", "", 0, 0); len(items) > 0 {
 			item := items[0]
@@ -510,6 +518,11 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 			recentRoutingNetwork = strings.ToLower(strings.TrimSpace(item.Network))
 			recentRoutingSource = strings.ToLower(strings.TrimSpace(item.Source))
 		}
+		_, liveStats := routingHitStore.listWithStats(1, "live", "", "", "", "", "", "", 0, 60)
+		liveHitsTotal60s = liveStats.TotalMatched
+		liveHitsNode60s = liveStats.Actions["NODE"]
+		liveHitsDirect60s = liveStats.Actions["DIRECT"]
+		liveHitsReject60s = liveStats.Actions["REJECT"]
 	}
 
 	issues := make([]string, 0, 4)
@@ -588,24 +601,30 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 		},
 		"failover": failoverStatus,
 		"routing": map[string]any{
-			"enabled":             routingEnabled,
-			"rule_count":          routingRuleCount,
-			"provider_count":      routingProviderCount,
-			"dns_map_ip_count":    dnsMapIPCount,
-			"dns_map_match_count": dnsMapMappingCount,
-			"dns_upstream_count":  dnsUpstreamCount,
-			"dns_queries_udp":     dnsQueriesUDP,
-			"dns_queries_tcp":     dnsQueriesTCP,
-			"dns_query_success":   dnsQuerySuccess,
-			"dns_query_failure":   dnsQueryFailure,
-			"recent_node":         recentRoutingNode,
-			"recent_action":       recentRoutingAction,
-			"recent_rule":         recentRoutingRule,
-			"recent_time":         recentRoutingTime,
-			"recent_destination":  recentRoutingDestination,
-			"recent_network":      recentRoutingNetwork,
-			"recent_source":       recentRoutingSource,
-			"egress_probe_last":   egressProbeLast,
+			"enabled":              routingEnabled,
+			"ipv6_egress_strict":   routingIPv6EgressStrict,
+			"rule_count":           routingRuleCount,
+			"provider_count":       routingProviderCount,
+			"dns_map_ip_count":     dnsMapIPCount,
+			"dns_map_match_count":  dnsMapMappingCount,
+			"dns_upstream_count":   dnsUpstreamCount,
+			"dns_queries_udp":      dnsQueriesUDP,
+			"dns_queries_tcp":      dnsQueriesTCP,
+			"dns_query_success":    dnsQuerySuccess,
+			"dns_query_failure":    dnsQueryFailure,
+			"dns_family_filtered":  dnsFamilyFiltered,
+			"recent_node":          recentRoutingNode,
+			"recent_action":        recentRoutingAction,
+			"recent_rule":          recentRoutingRule,
+			"recent_time":          recentRoutingTime,
+			"recent_destination":   recentRoutingDestination,
+			"recent_network":       recentRoutingNetwork,
+			"recent_source":        recentRoutingSource,
+			"live_hits_60s_total":  liveHitsTotal60s,
+			"live_hits_60s_node":   liveHitsNode60s,
+			"live_hits_60s_direct": liveHitsDirect60s,
+			"live_hits_60s_reject": liveHitsReject60s,
+			"egress_probe_last":    egressProbeLast,
 		},
 		"bypass": map[string]any{
 			"node_total":      nodeBypass.Total,
@@ -617,6 +636,13 @@ func (s *apiState) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"updated_at":      nodeBypass.UpdatedAt,
 		},
 		"inbound": inboundRuntimeStatsSnapshot(),
+		"meta": map[string]any{
+			"node_tls": map[string]any{
+				"allow_insecure_modes":        nodeopts.AllowInsecureModeValues(),
+				"allow_insecure_default_mode": nodeopts.AllowInsecureModeFromBool(nodeopts.DefaultAllowInsecure),
+				"allow_insecure_default":      nodeopts.DefaultAllowInsecure,
+			},
+		},
 		"health": map[string]any{
 			"ok":     len(issues) == 0,
 			"issues": issues,

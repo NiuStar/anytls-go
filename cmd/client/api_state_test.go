@@ -39,6 +39,13 @@ func TestHandleStatus(t *testing.T) {
 			Enabled bool `json:"enabled"`
 			Running bool `json:"running"`
 		} `json:"tun"`
+		Meta struct {
+			NodeTLS struct {
+				AllowInsecureModes       []string `json:"allow_insecure_modes"`
+				AllowInsecureDefaultMode string   `json:"allow_insecure_default_mode"`
+				AllowInsecureDefault     bool     `json:"allow_insecure_default"`
+			} `json:"node_tls"`
+		} `json:"meta"`
 	}
 	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode response failed: %v", err)
@@ -54,6 +61,13 @@ func TestHandleStatus(t *testing.T) {
 	}
 	if !out.Tun.Enabled || out.Tun.Running {
 		t.Fatalf("unexpected tun status: %+v", out.Tun)
+	}
+	if out.Meta.NodeTLS.AllowInsecureDefaultMode != "true" || !out.Meta.NodeTLS.AllowInsecureDefault {
+		t.Fatalf("unexpected node tls default meta: %+v", out.Meta.NodeTLS)
+	}
+	expectedModes := []string{"default", "true", "false"}
+	if !reflect.DeepEqual(out.Meta.NodeTLS.AllowInsecureModes, expectedModes) {
+		t.Fatalf("unexpected node tls mode list: got=%v want=%v", out.Meta.NodeTLS.AllowInsecureModes, expectedModes)
 	}
 }
 
