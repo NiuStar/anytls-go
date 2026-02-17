@@ -4,10 +4,16 @@
 *.exe
 *.zip
 .vscode
+/.idea/
 /docs
 /scripts/
+scripts/**/*.log
+scripts/**/*.tmp
+scripts/**/tmp/
 /.gocache/
+/.gocache_local/
 /cmd/client/webui/node_modules/
+/cmd/client/webui/dist/
 /.DS_Store
 /server
 /.gocache_test/

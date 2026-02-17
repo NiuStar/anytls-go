@@ -182,6 +182,365 @@ func (s *apiState) handleRouteSelfHeal(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *apiState) handleRouteOSProbe(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	s.lock.Lock()
+	cfg := *s.cfg
+	cfg.Nodes = append([]clientNodeConfig(nil), s.cfg.Nodes...)
+	current := s.manager.CurrentNodeName()
+	tunRuntime := s.tun
+	tunRunning := tunRuntime != nil
+	routingHitStore := s.routingHits
+	s.lock.Unlock()
+
+	tunRuntimeDeviceName := ""
+	tunRuntimeConfigName := ""
+	tunRuntimeAutoRoute := false
+	tunRouteManagerActive := false
+	tunRouteNodeServer := ""
+	if tunRuntime != nil {
+		tunRuntime.lock.Lock()
+		tunRuntimeConfigName = strings.TrimSpace(tunRuntime.config.Name)
+		tunRuntimeAutoRoute = tunRuntime.config.AutoRoute
+		tunRouteNodeServer = strings.TrimSpace(tunRuntime.routeNodeServer)
+		tunRouteManagerActive = tunRuntime.route != nil
+		if tunRuntime.device != nil {
+			tunRuntimeDeviceName = strings.TrimSpace(tunRuntime.device.Name())
+		}
+		tunRuntime.lock.Unlock()
+	}
+
+	tunEnabled := cfg.Tun != nil && cfg.Tun.Enabled
+	tunAutoRoute := cfg.Tun != nil && cfg.Tun.AutoRoute
+	tunConfiguredName := ""
+	if cfg.Tun != nil {
+		tunConfiguredName = normalizeTunDeviceNameForOS(runtime.GOOS, strings.TrimSpace(cfg.Tun.Name))
+	}
+	node, _ := findNodeByName(cfg.Nodes, current)
+	server := strings.TrimSpace(node.Server)
+	serverHost := ""
+	if server != "" {
+		if host, err := resolveTargetHost(server); err == nil {
+			serverHost = strings.TrimSpace(host)
+		}
+	}
+
+	type cmdProbe struct {
+		Command   string `json:"command"`
+		OK        bool   `json:"ok"`
+		Output    string `json:"output,omitempty"`
+		Error     string `json:"error,omitempty"`
+		Interface string `json:"interface,omitempty"`
+		Gateway   string `json:"gateway,omitempty"`
+	}
+
+	buildCmdProbe := func(command string, out string, err error) cmdProbe {
+		item := cmdProbe{
+			Command: strings.TrimSpace(command),
+			OK:      err == nil,
+			Output:  strings.TrimSpace(out),
+		}
+		if err != nil {
+			item.Error = strings.TrimSpace(err.Error())
+		}
+		return item
+	}
+
+	probes := map[string]any{}
+	notes := make([]string, 0, 8)
+	appendNote := func(text string) {
+		text = strings.TrimSpace(text)
+		if text == "" {
+			return
+		}
+		notes = append(notes, text)
+	}
+
+	liveHitsTotal60s := 0
+	liveHitsNode60s := 0
+	liveHitsDirect60s := 0
+	liveHitsReject60s := 0
+	if routingHitStore != nil {
+		_, liveStats := routingHitStore.listWithStats(1, "live", "", "", "", "", "", "", 0, 60)
+		liveHitsTotal60s = liveStats.TotalMatched
+		liveHitsNode60s = liveStats.Actions["NODE"]
+		liveHitsDirect60s = liveStats.Actions["DIRECT"]
+		liveHitsReject60s = liveStats.Actions["REJECT"]
+	}
+
+	activeTunIface := ""
+	defaultProbe := cmdProbe{}
+	publicProbe := cmdProbe{}
+	splitProbe := cmdProbe{}
+	serverProbe := cmdProbe{}
+	commandFailures := 0
+	splitRouteOnTun := false
+
+	switch runtime.GOOS {
+	case "darwin":
+		{
+			out, err := runCommand("route", "-n", "get", "default")
+			defaultProbe = buildCmdProbe("route -n get default", out, err)
+			if err == nil {
+				gateway, iface := parseDarwinRouteGetOutput(out)
+				defaultProbe.Interface = strings.TrimSpace(iface)
+				defaultProbe.Gateway = strings.TrimSpace(gateway)
+			} else {
+				commandFailures++
+			}
+		}
+		{
+			out, err := runCommand("route", "-n", "get", "1.1.1.1")
+			publicProbe = buildCmdProbe("route -n get 1.1.1.1", out, err)
+			if err == nil {
+				gateway, iface := parseDarwinRouteGetOutput(out)
+				publicProbe.Interface = strings.TrimSpace(iface)
+				publicProbe.Gateway = strings.TrimSpace(gateway)
+			} else {
+				commandFailures++
+			}
+		}
+		{
+			out, err := runCommand("route", "-n", "get", "151.101.1.69")
+			splitProbe = buildCmdProbe("route -n get 151.101.1.69", out, err)
+			if err == nil {
+				gateway, iface := parseDarwinRouteGetOutput(out)
+				splitProbe.Interface = strings.TrimSpace(iface)
+				splitProbe.Gateway = strings.TrimSpace(gateway)
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(iface)), "utun") {
+					splitRouteOnTun = true
+					activeTunIface = strings.TrimSpace(iface)
+				}
+			} else {
+				commandFailures++
+			}
+		}
+		if serverHost != "" {
+			out, err := runCommand("route", "-n", "get", serverHost)
+			serverProbe = buildCmdProbe(fmt.Sprintf("route -n get %s", serverHost), out, err)
+			if err == nil {
+				gateway, iface := parseDarwinRouteGetOutput(out)
+				serverProbe.Interface = strings.TrimSpace(iface)
+				serverProbe.Gateway = strings.TrimSpace(gateway)
+			} else {
+				commandFailures++
+			}
+		}
+	default:
+		appendNote(fmt.Sprintf("当前平台 %s 暂未实现系统路由快照详情", runtime.GOOS))
+	}
+
+	probes["route_default"] = defaultProbe
+	probes["route_public"] = publicProbe
+	probes["route_split_probe"] = splitProbe
+	if strings.TrimSpace(serverHost) != "" {
+		probes["route_server"] = serverProbe
+	}
+
+	if runtime.GOOS == "darwin" {
+		runtimeDeviceSeen := false
+		netstatRouteTable := cmdProbe{}
+		splitV4 := map[string]any{
+			"route_0_1": map[string]any{
+				"present":   false,
+				"on_tun":    false,
+				"interface": "",
+				"gateway":   "",
+				"raw_line":  "",
+			},
+			"route_128_1": map[string]any{
+				"present":   false,
+				"on_tun":    false,
+				"interface": "",
+				"gateway":   "",
+				"raw_line":  "",
+			},
+		}
+		{
+			out, err := runCommand("netstat", "-rn", "-f", "inet")
+			netstatRouteTable = buildCmdProbe("netstat -rn -f inet", out, err)
+			if err != nil {
+				commandFailures++
+			} else {
+				for _, line := range strings.Split(out, "\n") {
+					fields := strings.Fields(strings.TrimSpace(line))
+					if len(fields) < 4 {
+						continue
+					}
+					dst := strings.TrimSpace(fields[0])
+					var key string
+					switch dst {
+					case "0/1", "0.0/1", "0.0.0.0/1":
+						key = "route_0_1"
+					case "128/1", "128.0/1", "128.0.0.0/1":
+						key = "route_128_1"
+					default:
+						continue
+					}
+					entry, ok := splitV4[key].(map[string]any)
+					if !ok {
+						continue
+					}
+					iface := strings.TrimSpace(fields[len(fields)-1])
+					gateway := ""
+					if len(fields) >= 2 {
+						gateway = strings.TrimSpace(fields[1])
+					}
+					entry["present"] = true
+					entry["interface"] = iface
+					entry["gateway"] = gateway
+					entry["raw_line"] = strings.TrimSpace(line)
+					onTun := strings.HasPrefix(strings.ToLower(iface), "utun")
+					entry["on_tun"] = onTun
+					if onTun {
+						splitRouteOnTun = true
+						if activeTunIface == "" {
+							activeTunIface = iface
+						}
+					}
+				}
+			}
+		}
+		probes["route_table_inet"] = netstatRouteTable
+		probes["route_split_v4"] = splitV4
+
+		ifListOutput, ifListErr := runCommand("ifconfig", "-l")
+		ifListProbe := buildCmdProbe("ifconfig -l", ifListOutput, ifListErr)
+		if ifListErr != nil {
+			commandFailures++
+		}
+		utunIfaces := make([]string, 0, 8)
+		if ifListErr == nil {
+			for _, item := range strings.Fields(ifListOutput) {
+				name := strings.TrimSpace(item)
+				if strings.HasPrefix(strings.ToLower(name), "utun") {
+					utunIfaces = append(utunIfaces, name)
+				}
+			}
+			sort.Strings(utunIfaces)
+		}
+		ifListProbe.Output = strings.Join(utunIfaces, " ")
+		if tunRuntimeDeviceName != "" {
+			for _, iface := range utunIfaces {
+				if strings.EqualFold(strings.TrimSpace(iface), tunRuntimeDeviceName) {
+					runtimeDeviceSeen = true
+					break
+				}
+			}
+		}
+		probes["ifconfig_utun_list"] = map[string]any{
+			"command":             ifListProbe.Command,
+			"ok":                  ifListProbe.OK,
+			"error":               ifListProbe.Error,
+			"interfaces":          utunIfaces,
+			"runtime_device_seen": runtimeDeviceSeen,
+		}
+
+		utunDetails := make([]map[string]any, 0, len(utunIfaces))
+		for _, iface := range utunIfaces {
+			out, err := runCommand("ifconfig", iface)
+			row := map[string]any{
+				"interface": iface,
+				"command":   fmt.Sprintf("ifconfig %s", iface),
+				"ok":        err == nil,
+			}
+			if err != nil {
+				row["error"] = err.Error()
+				commandFailures++
+			} else {
+				row["output"] = out
+			}
+			utunDetails = append(utunDetails, row)
+		}
+		probes["ifconfig_utun_detail"] = utunDetails
+
+		if activeTunIface != "" {
+			out, err := runCommand("netstat", "-bI", activeTunIface)
+			netstatProbe := buildCmdProbe(fmt.Sprintf("netstat -bI %s", activeTunIface), out, err)
+			if err != nil {
+				commandFailures++
+				outFallback, fallbackErr := runCommand("netstat", "-I", activeTunIface)
+				netstatProbe = buildCmdProbe(fmt.Sprintf("netstat -I %s", activeTunIface), outFallback, fallbackErr)
+				if fallbackErr != nil {
+					commandFailures++
+				}
+			}
+			probes["netstat_active_utun"] = netstatProbe
+		}
+	}
+
+	if tunRunning && tunAutoRoute {
+		if !splitRouteOnTun {
+			appendNote("TUN 运行中且 auto_route 开启，但分片路由未命中 utun（0/1、128/1）")
+		}
+		if activeTunIface == "" {
+			appendNote("TUN 运行中，但未识别到承载分片路由的 utun 出口")
+		}
+	} else if tunRunning && !tunAutoRoute {
+		appendNote("TUN 运行中但 auto_route 已关闭，系统流量不会被全局接管")
+	}
+	if tunConfiguredName != "" && strings.HasPrefix(strings.ToLower(tunConfiguredName), "utun") && activeTunIface != "" && !strings.EqualFold(tunConfiguredName, activeTunIface) {
+		appendNote(fmt.Sprintf("配置 TUN 名称为 %s，当前系统实际出口为 %s（可能是自动分配）", tunConfiguredName, activeTunIface))
+	}
+	if tunRunning && tunRuntimeDeviceName == "" {
+		appendNote("TUN 运行中，但运行态未暴露有效设备名（可能已失活）")
+	}
+	if runtime.GOOS == "darwin" && tunRunning && tunRuntimeDeviceName != "" {
+		if listMap, ok := probes["ifconfig_utun_list"].(map[string]any); ok {
+			if seen, ok := listMap["runtime_device_seen"].(bool); ok && !seen {
+				appendNote(fmt.Sprintf("运行态设备 %s 未出现在 ifconfig -l 中，可能已被系统回收", tunRuntimeDeviceName))
+			}
+		}
+	}
+	if tunRunning && tunAutoRoute && !tunRouteManagerActive {
+		appendNote("TUN 运行中且 auto_route 开启，但 route manager 未挂载（自动路由不会生效）")
+	}
+	if tunRunning && liveHitsTotal60s == 0 {
+		appendNote("最近 60 秒 live 命中为 0，浏览器流量可能未进入 anytls 路由入口")
+	}
+	if tunRunning && strings.TrimSpace(serverHost) != "" && strings.HasPrefix(strings.ToLower(strings.TrimSpace(serverProbe.Interface)), "utun") {
+		appendNote(fmt.Sprintf("服务端路由在 %s，存在回环风险（应走物理网卡）", strings.TrimSpace(serverProbe.Interface)))
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"time":        time.Now().Format(time.RFC3339),
+		"os":          runtime.GOOS,
+		"arch":        runtime.GOARCH,
+		"current":     current,
+		"server":      server,
+		"server_host": serverHost,
+		"tun": map[string]any{
+			"enabled":              tunEnabled,
+			"running":              tunRunning,
+			"auto_route":           tunAutoRoute,
+			"configured_name":      tunConfiguredName,
+			"active_iface":         activeTunIface,
+			"runtime_device":       tunRuntimeDeviceName,
+			"runtime_config_name":  tunRuntimeConfigName,
+			"runtime_auto_route":   tunRuntimeAutoRoute,
+			"route_manager_active": tunRouteManagerActive,
+			"route_node_server":    tunRouteNodeServer,
+		},
+		"routing_live_hits_60s": map[string]any{
+			"total":  liveHitsTotal60s,
+			"node":   liveHitsNode60s,
+			"direct": liveHitsDirect60s,
+			"reject": liveHitsReject60s,
+		},
+		"probes": probes,
+		"summary": map[string]any{
+			"ok":               commandFailures == 0 && (!tunRunning || !tunAutoRoute || splitRouteOnTun),
+			"command_failures": commandFailures,
+			"split_route_on_tun": splitRouteOnTun,
+			"notes":            notes,
+		},
+	})
+}
+
 func (s *apiState) handleRouteCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")

@@ -268,23 +268,65 @@ type tunStartResult struct {
 }
 
 func startTunRuntimeWithTimeout(ctx context.Context, cfg clientTunConfig, socksListen string, selectedNode clientNodeConfig, timeout time.Duration) (*tunRuntime, error) {
-	if timeout <= 0 {
-		timeout = 15 * time.Second
+	if ctx == nil {
+		ctx = context.Background()
 	}
+	timeout = resolveTunStartTimeout(cfg, timeout)
+	// Runtime lifecycle must follow parent ctx (apiCtx), not startup timeout ctx.
+	// Otherwise defer-cancel after successful return would immediately close TUN.
+	runtimeCtx, runtimeCancel := context.WithCancel(ctx)
 	ch := make(chan tunStartResult, 1)
 	go func() {
-		rt, err := startTunRuntime(ctx, cfg, socksListen, selectedNode)
+		rt, err := startTunRuntime(runtimeCtx, cfg, socksListen, selectedNode)
 		ch <- tunStartResult{runtime: rt, err: err}
 	}()
 
 	select {
 	case <-ctx.Done():
+		runtimeCancel()
 		return nil, ctx.Err()
 	case result := <-ch:
+		if result.err != nil {
+			runtimeCancel()
+		}
 		return result.runtime, result.err
 	case <-time.After(timeout):
+		runtimeCancel()
+		go func() {
+			result := <-ch
+			if result.runtime != nil {
+				if err := result.runtime.Close(); err != nil {
+					logrus.Warnf("[Client] cleanup late TUN runtime after timeout failed: %v", err)
+				}
+			}
+		}()
 		return nil, fmt.Errorf("start tun runtime timeout after %s", timeout)
 	}
+}
+
+func resolveTunStartTimeout(cfg clientTunConfig, requested time.Duration) time.Duration {
+	if requested > 0 {
+		return requested
+	}
+	if raw := strings.TrimSpace(os.Getenv("ANYTLS_TUN_START_TIMEOUT_SEC")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 600 {
+			return time.Duration(n) * time.Second
+		}
+	}
+
+	// 15s is often enough on Linux/OpenWrt, but too aggressive on macOS where
+	// networksetup/route operations may require dozens of subprocess calls.
+	timeout := 15 * time.Second
+	if runtime.GOOS == "darwin" {
+		timeout = 45 * time.Second
+		if cfg.AutoRoute {
+			timeout += 10 * time.Second
+		}
+		if cfg.DisableOtherProxies {
+			timeout += 10 * time.Second
+		}
+	}
+	return timeout
 }
 
 func (t *tunRuntime) routeMaintenanceLoop(ctx context.Context) {
@@ -303,15 +345,9 @@ func (t *tunRuntime) routeMaintenanceLoop(ctx context.Context) {
 				continue
 			}
 			err := route.ActivateForNode(server)
-			var failed []string
-			if err == nil {
-				failed = t.reapplyBypassTargetsLocked(route)
-			}
 			t.lock.Unlock()
 			if err != nil {
 				logrus.Warnf("[Client] tun route keepalive failed: %v", err)
-			} else if len(failed) > 0 {
-				logrus.Warnf("[Client] tun route keepalive bypass replay failed: %d target(s): %s", len(failed), strings.Join(failed, ", "))
 			}
 		}
 	}
@@ -405,11 +441,8 @@ func (t *tunRuntime) OnSwitch(node clientNodeConfig) error {
 	if err := t.route.UpdateNode(node.Server); err != nil {
 		return err
 	}
-	if failed := t.reapplyBypassTargetsLocked(t.route); len(failed) > 0 {
-		logrus.Warnf("[Client] tun bypass replay after switch failed: %d target(s): %s", len(failed), strings.Join(failed, ", "))
-	}
 	if runtime.GOOS == "darwin" {
-		flushDarwinDNSCache()
+		go flushDarwinDNSCache()
 	}
 	return nil
 }
@@ -475,6 +508,27 @@ func (t *tunRuntime) sameConfig(cfg clientTunConfig) bool {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	return t.config == cfg
+}
+
+func (t *tunRuntime) reuseCheck(cfg clientTunConfig) (bool, string) {
+	if t == nil {
+		return false, "nil runtime"
+	}
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.config != cfg {
+		return false, "config changed"
+	}
+	if t.device == nil {
+		return false, "device missing"
+	}
+	if strings.TrimSpace(t.device.Name()) == "" {
+		return false, "device name empty"
+	}
+	if cfg.AutoRoute && t.route == nil {
+		return false, "auto_route enabled but route manager missing"
+	}
+	return true, ""
 }
 
 func normalizeTunProxyAddr(listen string) (string, error) {
@@ -549,8 +603,12 @@ type darwinRouteManager struct {
 	defaultGateway6 string
 	defaultIf6      string
 
-	bypass  map[string]struct{}
-	bypass6 map[string]struct{}
+	bypass       map[string]struct{}
+	nodeBypass   map[string]struct{}
+	extraBypass  map[string]struct{}
+	bypass6      map[string]struct{}
+	nodeBypass6  map[string]struct{}
+	extraBypass6 map[string]struct{}
 }
 
 type linuxDefaultRouteCandidate struct {
@@ -942,9 +1000,13 @@ func (m *linuxRouteManager) recoverDefaultRouteFallback(primaryErr error) error 
 
 func newDarwinRouteManager(tunName string) (*darwinRouteManager, error) {
 	m := &darwinRouteManager{
-		tunName: tunName,
-		bypass:  make(map[string]struct{}),
-		bypass6: make(map[string]struct{}),
+		tunName:      tunName,
+		bypass:       make(map[string]struct{}),
+		nodeBypass:   make(map[string]struct{}),
+		extraBypass:  make(map[string]struct{}),
+		bypass6:      make(map[string]struct{}),
+		nodeBypass6:  make(map[string]struct{}),
+		extraBypass6: make(map[string]struct{}),
 	}
 	if err := m.refreshDefaultRoute(); err != nil {
 		// Allow manager creation when default route is temporarily on utun.
@@ -1224,10 +1286,15 @@ func (m *darwinRouteManager) UpdateNode(server string) error {
 			return err
 		}
 		m.bypass[ip] = struct{}{}
+		m.nodeBypass[ip] = struct{}{}
 	}
 
-	for ip := range m.bypass {
+	for ip := range m.nodeBypass {
 		if _, exists := target4[ip]; exists {
+			continue
+		}
+		delete(m.nodeBypass, ip)
+		if _, keep := m.extraBypass[ip]; keep {
 			continue
 		}
 		_, _ = runCommand("route", "-n", "delete", "-host", ip)
@@ -1240,15 +1307,20 @@ func (m *darwinRouteManager) UpdateNode(server string) error {
 				return err
 			}
 			m.bypass6[ip] = struct{}{}
+			m.nodeBypass6[ip] = struct{}{}
 		}
+	}
 
-		for ip := range m.bypass6 {
-			if _, exists := target6[ip]; exists {
-				continue
-			}
-			_, _ = runCommand("route", "-n", "delete", "-inet6", "-host", ip)
-			delete(m.bypass6, ip)
+	for ip := range m.nodeBypass6 {
+		if _, exists := target6[ip]; exists {
+			continue
 		}
+		delete(m.nodeBypass6, ip)
+		if _, keep := m.extraBypass6[ip]; keep {
+			continue
+		}
+		_, _ = runCommand("route", "-n", "delete", "-inet6", "-host", ip)
+		delete(m.bypass6, ip)
 	}
 	return nil
 }
@@ -1343,22 +1415,26 @@ func (m *darwinRouteManager) EnsureBypass(target string) error {
 	}
 	for ip := range target4 {
 		if _, exists := m.bypass[ip]; exists {
+			m.extraBypass[ip] = struct{}{}
 			continue
 		}
 		if err := m.addBypass(ip); err != nil {
 			return err
 		}
 		m.bypass[ip] = struct{}{}
+		m.extraBypass[ip] = struct{}{}
 	}
 	if m.defaultGateway6 != "" || m.defaultIf6 != "" {
 		for ip := range target6 {
 			if _, exists := m.bypass6[ip]; exists {
+				m.extraBypass6[ip] = struct{}{}
 				continue
 			}
 			if err := m.addBypass6(ip); err != nil {
 				return err
 			}
 			m.bypass6[ip] = struct{}{}
+			m.extraBypass6[ip] = struct{}{}
 		}
 	}
 	return nil
@@ -1369,10 +1445,14 @@ func (m *darwinRouteManager) Close() error {
 		_, _ = runCommand("route", "-n", "delete", "-host", ip)
 	}
 	m.bypass = map[string]struct{}{}
+	m.nodeBypass = map[string]struct{}{}
+	m.extraBypass = map[string]struct{}{}
 	for ip := range m.bypass6 {
 		_, _ = runCommand("route", "-n", "delete", "-inet6", "-host", ip)
 	}
 	m.bypass6 = map[string]struct{}{}
+	m.nodeBypass6 = map[string]struct{}{}
+	m.extraBypass6 = map[string]struct{}{}
 
 	_, _ = runCommand("route", "-n", "delete", "-net", "0.0.0.0/1")
 	_, _ = runCommand("route", "-n", "delete", "-net", "128.0.0.0/1")

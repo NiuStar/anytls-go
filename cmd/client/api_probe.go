@@ -22,8 +22,8 @@ import (
 const (
 	defaultLatencyTarget      = "1.1.1.1:443"
 	defaultBandwidthURL       = "https://speed.cloudflare.com/__down?bytes=5000000"
-	defaultLatencyTimeoutMS   = 2000
-	maxLatencyTimeoutMS       = 2000
+	defaultLatencyTimeoutMS   = 3000
+	maxLatencyTimeoutMS       = 10000
 	defaultBandwidthTimeoutMS = 20000
 	maxBandwidthTimeoutMS     = 120000
 	minBandwidthTimeoutMS     = 200
@@ -39,15 +39,26 @@ const (
 )
 
 type latencyProbeResult struct {
-	Name      string    `json:"name"`
-	Target    string    `json:"target"`
-	Count     int       `json:"count"`
-	Success   int       `json:"success"`
-	AvgMS     float64   `json:"avg_ms,omitempty"`
-	MinMS     float64   `json:"min_ms,omitempty"`
-	MaxMS     float64   `json:"max_ms,omitempty"`
-	SamplesMS []float64 `json:"samples_ms,omitempty"`
-	Error     string    `json:"error,omitempty"`
+	Name         string                `json:"name"`
+	Target       string                `json:"target"`
+	Count        int                   `json:"count"`
+	Success      int                   `json:"success"`
+	Failure      int                   `json:"failure,omitempty"`
+	AvgMS        float64               `json:"avg_ms,omitempty"`
+	MinMS        float64               `json:"min_ms,omitempty"`
+	MaxMS        float64               `json:"max_ms,omitempty"`
+	SamplesMS    []float64             `json:"samples_ms,omitempty"`
+	Attempts     []latencyProbeAttempt `json:"attempts,omitempty"`
+	Error        string                `json:"error,omitempty"`
+	LastErrorRaw string                `json:"last_error_raw,omitempty"`
+}
+
+type latencyProbeAttempt struct {
+	Round      int     `json:"round"`
+	Try        int     `json:"try"`
+	DurationMS float64 `json:"duration_ms,omitempty"`
+	OK         bool    `json:"ok"`
+	Error      string  `json:"error,omitempty"`
 }
 
 type bandwidthProbeResult struct {
@@ -533,7 +544,17 @@ func measureNodeLatency(node clientNodeConfig, target string, count int, timeout
 		result.Error = err.Error()
 		return result
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
+
+	rebuildClient := func() error {
+		_ = client.Close()
+		next, buildErr := buildClientFromNode(context.Background(), node, minIdle)
+		if buildErr != nil {
+			return buildErr
+		}
+		client = next
+		return nil
+	}
 
 	destination := M.ParseSocksaddr(target)
 	if !destination.IsValid() {
@@ -542,25 +563,70 @@ func measureNodeLatency(node clientNodeConfig, target string, count int, timeout
 	}
 
 	samples := make([]float64, 0, count)
+	attempts := make([]latencyProbeAttempt, 0, count*2)
+	lastErr := ""
 	for i := 0; i < count; i++ {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		start := time.Now()
-		conn, probeErr := client.CreateProxy(ctx, destination)
-		elapsed := time.Since(start)
-		cancel()
-		if probeErr != nil {
-			result.Error = enrichEgressIPProbeError(probeErr.Error(), node)
-			continue
+		retried := false
+		tryNo := 1
+		roundOK := false
+		probeTimeout := timeout
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			start := time.Now()
+			conn, probeErr := client.CreateProxy(ctx, destination)
+			elapsed := time.Since(start)
+			cancel()
+			elapsedMS := float64(elapsed.Microseconds()) / 1000.0
+			if probeErr != nil {
+				errText := enrichEgressIPProbeError(probeErr.Error(), node)
+				attempts = append(attempts, latencyProbeAttempt{
+					Round:      i + 1,
+					Try:        tryNo,
+					DurationMS: elapsedMS,
+					OK:         false,
+					Error:      errText,
+				})
+				if !retried && shouldRetryLatencyProbeError(errText) {
+					retried = true
+					tryNo++
+					if isTimeoutProbeError(errText) && probeTimeout < 5*time.Second {
+						probeTimeout *= 2
+						if probeTimeout > 5*time.Second {
+							probeTimeout = 5 * time.Second
+						}
+					}
+					continue
+				}
+				lastErr = errText
+				break
+			}
+			_ = conn.Close()
+			samples = append(samples, elapsedMS)
+			attempts = append(attempts, latencyProbeAttempt{
+				Round:      i + 1,
+				Try:        tryNo,
+				DurationMS: elapsedMS,
+				OK:         true,
+			})
+			roundOK = true
+			break
 		}
-		_ = conn.Close()
-		ms := float64(elapsed.Microseconds()) / 1000.0
-		samples = append(samples, ms)
+		if !roundOK && i < count-1 {
+			if rebuildErr := rebuildClient(); rebuildErr != nil {
+				lastErr = rebuildErr.Error()
+				break
+			}
+		}
 	}
 	result.Success = len(samples)
+	result.Failure = count - result.Success
+	result.Attempts = attempts
+	result.LastErrorRaw = lastErr
 	if len(samples) == 0 {
-		if result.Error == "" {
-			result.Error = "all probes failed"
+		if lastErr == "" {
+			lastErr = "all probes failed"
 		}
+		result.Error = lastErr
 		return result
 	}
 	result.SamplesMS = samples
@@ -577,6 +643,8 @@ func measureNodeLatency(node clientNodeConfig, target string, count int, timeout
 		}
 	}
 	result.AvgMS = sum / float64(len(samples))
+	// Partial failures should not be reported as a hard probe failure.
+	result.Error = ""
 	return result
 }
 
@@ -596,7 +664,7 @@ func measureNodeBandwidth(node clientNodeConfig, probeURLs []string, maxBytes in
 func measureNodeBandwidthOnce(node clientNodeConfig, targetURL string, maxBytes int64, timeout time.Duration, minIdle int) bandwidthProbeResult {
 	result := bandwidthProbeResult{Name: node.Name, URL: targetURL}
 
-	clientCtx, clientCancel := context.WithTimeout(context.Background(), timeout*2)
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), timeout*3)
 	defer clientCancel()
 	client, err := buildClientFromNode(clientCtx, node, minIdle)
 	if err != nil {
@@ -605,70 +673,96 @@ func measureNodeBandwidthOnce(node clientNodeConfig, targetURL string, maxBytes 
 	}
 	defer client.Close()
 
-	transport := &http.Transport{
-		DisableKeepAlives:     true,
-		ForceAttemptHTTP2:     false,
-		ResponseHeaderTimeout: timeout,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if network != "tcp" && network != "tcp4" && network != "tcp6" {
-				network = "tcp"
-			}
-			dest := M.ParseSocksaddr(addr)
-			if !dest.IsValid() {
-				return nil, fmt.Errorf("invalid destination: %s", addr)
-			}
-			return client.CreateProxy(ctx, dest)
-		},
-	}
-	defer transport.CloseIdleConnections()
-
-	httpClient := &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-	}
-	reqCtx, reqCancel := context.WithTimeout(context.Background(), timeout)
-	defer reqCancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
-	if err != nil {
-		result.Error = err.Error()
-		return result
-	}
-	start := time.Now()
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		result.Error = enrichEgressIPProbeError(err.Error(), node)
-		return result
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		result.Error = fmt.Sprintf("http status %d", resp.StatusCode)
-		return result
-	}
-
-	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBytes))
-	if err != nil {
-		duration := time.Since(start)
-		// If we already received enough bytes, keep result instead of hard-failing on close race.
-		if n >= minBandwidthBytes && (isClosedConnProbeError(err.Error()) || isTimeoutProbeError(err.Error())) {
-			if duration <= 0 {
-				duration = time.Millisecond
-			}
-			result.Bytes = n
-			result.DurationMS = duration.Milliseconds()
-			result.Mbps = float64(n) * 8 / duration.Seconds() / 1_000_000
-			return result
+	measureOnce := func(c *myClient) bandwidthProbeResult {
+		runResult := bandwidthProbeResult{Name: node.Name, URL: targetURL}
+		transport := &http.Transport{
+			DisableKeepAlives:     true,
+			ForceAttemptHTTP2:     false,
+			ResponseHeaderTimeout: timeout,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if network != "tcp" && network != "tcp4" && network != "tcp6" {
+					network = "tcp"
+				}
+				dest := M.ParseSocksaddr(addr)
+				if !dest.IsValid() {
+					return nil, fmt.Errorf("invalid destination: %s", addr)
+				}
+				return c.CreateProxy(ctx, dest)
+			},
 		}
-		result.Error = err.Error()
-		return result
+		defer transport.CloseIdleConnections()
+
+		httpClient := &http.Client{
+			Transport: transport,
+			Timeout:   timeout,
+		}
+		reqCtx, reqCancel := context.WithTimeout(context.Background(), timeout)
+		defer reqCancel()
+		req, buildErr := http.NewRequestWithContext(reqCtx, http.MethodGet, targetURL, nil)
+		if buildErr != nil {
+			runResult.Error = buildErr.Error()
+			return runResult
+		}
+		start := time.Now()
+		resp, doErr := httpClient.Do(req)
+		if doErr != nil {
+			runResult.Error = enrichEgressIPProbeError(doErr.Error(), node)
+			return runResult
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+			runResult.Error = fmt.Sprintf("http status %d", resp.StatusCode)
+			return runResult
+		}
+
+		n, copyErr := io.Copy(io.Discard, io.LimitReader(resp.Body, maxBytes))
+		if copyErr != nil {
+			duration := time.Since(start)
+			// If we already received enough bytes, keep result instead of hard-failing on close race.
+			if n >= minBandwidthBytes && (isClosedConnProbeError(copyErr.Error()) || isTimeoutProbeError(copyErr.Error())) {
+				if duration <= 0 {
+					duration = time.Millisecond
+				}
+				runResult.Bytes = n
+				runResult.DurationMS = duration.Milliseconds()
+				runResult.Mbps = float64(n) * 8 / duration.Seconds() / 1_000_000
+				return runResult
+			}
+			runResult.Error = copyErr.Error()
+			return runResult
+		}
+		duration := time.Since(start)
+		if duration <= 0 {
+			duration = time.Millisecond
+		}
+		runResult.Bytes = n
+		runResult.DurationMS = duration.Milliseconds()
+		runResult.Mbps = float64(n) * 8 / duration.Seconds() / 1_000_000
+		return runResult
 	}
-	duration := time.Since(start)
-	if duration <= 0 {
-		duration = time.Millisecond
+
+	first := measureOnce(client)
+	if first.Error == "" {
+		return first
 	}
-	result.Bytes = n
-	result.DurationMS = duration.Milliseconds()
-	result.Mbps = float64(n) * 8 / duration.Seconds() / 1_000_000
-	return result
+	if !shouldRetryBandwidthProbeError(first.Error) {
+		return first
+	}
+
+	_ = client.Close()
+	retryClient, retryErr := buildClientFromNode(clientCtx, node, minIdle)
+	if retryErr != nil {
+		first.Error = fmt.Sprintf("%s; retry build client failed: %v", first.Error, retryErr)
+		return first
+	}
+	defer retryClient.Close()
+
+	second := measureOnce(retryClient)
+	if second.Error == "" {
+		return second
+	}
+	second.Error = fmt.Sprintf("%s; retry after first error: %s", second.Error, first.Error)
+	return second
 }
 
 func isClosedConnProbeError(errText string) bool {
@@ -690,6 +784,31 @@ func isTimeoutProbeError(errText string) bool {
 		return false
 	}
 	return strings.Contains(errText, context.DeadlineExceeded.Error()) ||
+		strings.Contains(errText, "timeout")
+}
+
+func shouldRetryLatencyProbeError(errText string) bool {
+	errText = strings.ToLower(strings.TrimSpace(errText))
+	if errText == "" {
+		return false
+	}
+	return strings.Contains(errText, "connection reset by peer") ||
+		strings.Contains(errText, "unexpected eof") ||
+		strings.Contains(errText, "eof") ||
+		strings.Contains(errText, "broken pipe")
+}
+
+func shouldRetryBandwidthProbeError(errText string) bool {
+	errText = strings.ToLower(strings.TrimSpace(errText))
+	if errText == "" {
+		return false
+	}
+	return strings.Contains(errText, "connection reset by peer") ||
+		strings.Contains(errText, "unexpected eof") ||
+		strings.Contains(errText, "eof") ||
+		strings.Contains(errText, "broken pipe") ||
+		strings.Contains(errText, "context deadline exceeded") ||
+		strings.Contains(errText, "i/o timeout") ||
 		strings.Contains(errText, "timeout")
 }
 

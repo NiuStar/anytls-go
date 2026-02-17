@@ -88,21 +88,73 @@ func (m *runtimeClientManager) Switch(name string) error {
 	if prev != "" && prev != name {
 		oldClient = m.clients[prev]
 		// Drop previous current-node client so future switch takes effect immediately.
-		// Existing streams on old client will be closed below.
+		// Existing streams on old client will be drained asynchronously below.
 		delete(m.clients, prev)
 	}
 	m.currentName = name
 	m.lock.Unlock()
-	if oldClient != nil {
-		if err := oldClient.Close(); err != nil {
-			logrus.Warnf("[Client] switch node close old client failed: %s => %s: %v", prev, name, err)
-		} else {
-			logrus.Infof("[Client] switch node applied: %s => %s (old client closed)", prev, name)
-		}
-	} else if prev != "" && prev != name {
+	if prev != name {
 		logrus.Infof("[Client] switch node applied: %s => %s", prev, name)
+		m.warmupCurrentNodeClientAsync(name, m.switchWarmupCount())
+		if oldClient != nil {
+			m.closeNodeClientAsync(prev, name, oldClient)
+		}
 	}
 	return nil
+}
+
+func (m *runtimeClientManager) switchWarmupCount() int {
+	if m == nil {
+		return 1
+	}
+	count := 1
+	if m.minIdleSession >= 2 {
+		count = 2
+	}
+	if m.minIdleSession >= 4 {
+		count = 3
+	}
+	return count
+}
+
+func (m *runtimeClientManager) warmupCurrentNodeClientAsync(name string, count int) {
+	if m == nil || strings.TrimSpace(name) == "" || count <= 0 {
+		return
+	}
+	go func(target string, warmCount int) {
+		ctx, cancel := context.WithTimeout(m.ctx, 5*time.Second)
+		defer cancel()
+
+		m.lock.RLock()
+		if m.currentName != target {
+			m.lock.RUnlock()
+			return
+		}
+		client := m.clients[target]
+		m.lock.RUnlock()
+		if client == nil {
+			return
+		}
+
+		warmed := client.Warmup(ctx, warmCount)
+		if warmed > 0 {
+			logrus.Debugf("[Client] node client warmup completed: node=%s warmed=%d", target, warmed)
+		}
+	}(name, count)
+}
+
+func (m *runtimeClientManager) closeNodeClientAsync(from, to string, client *myClient) {
+	if m == nil || client == nil {
+		return
+	}
+	go func(prev, next string, c *myClient) {
+		startAt := time.Now()
+		if err := c.Close(); err != nil {
+			logrus.Warnf("[Client] switch node async close old client failed: %s => %s: %v", prev, next, err)
+			return
+		}
+		logrus.Infof("[Client] switch node old client drained: %s => %s (%s)", prev, next, time.Since(startAt).Round(time.Millisecond))
+	}(strings.TrimSpace(from), strings.TrimSpace(to), client)
 }
 
 func (m *runtimeClientManager) Node(name string) (clientNodeConfig, bool) {
@@ -303,13 +355,10 @@ func (m *runtimeClientManager) StartAutoFailover(cfg clientFailoverConfig) {
 	if probeTarget == "" {
 		probeTarget = defaultLatencyTarget
 	}
-	// On OpenWrt, pure IP probe can be false-positive (IP reachable while
-	// major TLS destinations like Google still fail). Keep legacy config, but
-	// auto-upgrade the default target at runtime for better health semantics.
-	if runtime.GOOS == "linux" && isOpenWrtRuntime() {
-		if strings.EqualFold(strings.TrimSpace(probeTarget), strings.TrimSpace(defaultLatencyTarget)) {
-			probeTarget = "www.google.com:443"
-		}
+	// Auto-upgrade legacy default probe target to platform-tuned multi-targets,
+	// reducing false failover switches caused by single-target jitter.
+	if strings.EqualFold(strings.TrimSpace(probeTarget), strings.TrimSpace(defaultLatencyTarget)) {
+		probeTarget = runtimeDefaultFailoverProbeTargets()
 	}
 	probeTargets := parseFailoverProbeTargets(probeTarget)
 	timeout := time.Duration(cfg.ProbeTimeoutMS) * time.Millisecond
@@ -521,6 +570,18 @@ func parseFailoverProbeTargets(raw string) []string {
 	return out
 }
 
+func runtimeDefaultFailoverProbeTargets() string {
+	if runtime.GOOS == "linux" && isOpenWrtRuntime() {
+		// OpenWrt often shows misleading pass on pure IP probes.
+		return "www.google.com:443,ip.sb:443,www.cloudflare.com:443"
+	}
+	if runtime.GOOS == "darwin" {
+		// Avoid depending on a single IP-only endpoint on macOS networks.
+		return "ip.sb:443,www.cloudflare.com:443,1.1.1.1:443"
+	}
+	return defaultLatencyTarget
+}
+
 func probeNodeReachable(node clientNodeConfig, targets []string, timeout time.Duration, minIdle int) (bool, string) {
 	ok, _, failedTarget := probeNodeReachableWithLatency(node, targets, timeout, minIdle)
 	return ok, failedTarget
@@ -530,17 +591,33 @@ func probeNodeReachableWithLatency(node clientNodeConfig, targets []string, time
 	if len(targets) == 0 {
 		targets = []string{defaultLatencyTarget}
 	}
+	minSuccess := len(targets)
+	if len(targets) >= 2 {
+		minSuccess = (len(targets) + 1) / 2
+	}
 	totalLatencyMS := 0.0
+	successCount := 0
+	failedTarget := ""
 	for _, target := range targets {
 		result := measureNodeLatency(node, target, 1, timeout, minIdle)
 		if result.Success <= 0 || result.Error != "" {
-			return false, 0, target
+			if failedTarget == "" {
+				failedTarget = target
+			}
+			continue
 		}
 		latencyMS := result.AvgMS
 		if latencyMS <= 0 && len(result.SamplesMS) > 0 {
 			latencyMS = result.SamplesMS[0]
 		}
 		totalLatencyMS += latencyMS
+		successCount++
 	}
-	return true, totalLatencyMS / float64(len(targets)), ""
+	if successCount < minSuccess {
+		return false, 0, failedTarget
+	}
+	if successCount <= 0 {
+		return false, 0, failedTarget
+	}
+	return true, totalLatencyMS / float64(successCount), ""
 }

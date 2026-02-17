@@ -12,6 +12,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,38 @@ import (
 )
 
 var clientDebugPaddingScheme = os.Getenv("CLIENT_DEBUG_PADDING_SCHEME") == "1"
+var sessionSynACKTimeout = parseSessionDurationMS("ANYTLS_SESSION_SYNACK_TIMEOUT_MS", 6000, 1000, 30000)
+var sessionControlWriteTimeout = parseSessionDurationMS("ANYTLS_SESSION_CONTROL_WRITE_TIMEOUT_MS", 8000, 2000, 30000)
+
+func parseSessionDurationMS(envKey string, defaultMS, minMS, maxMS int) time.Duration {
+	if minMS <= 0 {
+		minMS = 1
+	}
+	if maxMS < minMS {
+		maxMS = minMS
+	}
+	if defaultMS < minMS {
+		defaultMS = minMS
+	}
+	if defaultMS > maxMS {
+		defaultMS = maxMS
+	}
+	raw := strings.TrimSpace(os.Getenv(envKey))
+	if raw == "" {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	if ms < minMS {
+		ms = minMS
+	}
+	if ms > maxMS {
+		ms = maxMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 type Session struct {
 	conn     net.Conn
@@ -172,7 +205,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 		if s.synDone != nil {
 			s.synDone()
 		}
-		s.synDone = util.NewDeadlineWatcher(time.Second*3, func() {
+		s.synDone = util.NewDeadlineWatcher(sessionSynACKTimeout, func() {
 			s.Close()
 		})
 		s.synDoneLock.Unlock()
@@ -441,7 +474,7 @@ func (s *Session) writeControlFrame(frame frame) (int, error) {
 	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
 	buffer.Write(frame.data)
 
-	s.conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	s.conn.SetWriteDeadline(time.Now().Add(sessionControlWriteTimeout))
 
 	_, err := s.writeConn(buffer.Bytes())
 	buffer.Release()

@@ -344,45 +344,16 @@ func (h *dnsHijacker) exchange(ctx context.Context, destination M.Socksaddr, req
 		}
 		return nil, lastErr
 	}
-
-	targets := h.buildTargets(destination)
-	for _, target := range targets {
-		if h.isUpstreamBlocked(target, time.Now()) {
-			continue
+	resp, err := h.exchangePlainDNS(ctx, destination, request, true)
+	if err != nil {
+		if lastErr == nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("%v; %w", lastErr, err)
 		}
-		// Prefer TCP to reduce UDP-based DNS poisoning/interception on some networks.
-		startAt := time.Now()
-		resp, err := h.exchangeSingleTCP(ctx, target, request)
-		if err == nil {
-			if blocked := h.responseBlockedIPCount(resp); blocked > 0 {
-				rejectErr := fmt.Errorf("dns response contains %d quarantined ip answer(s)", blocked)
-				h.markUpstreamFailure(target, rejectErr, startAt)
-				lastErr = rejectErr
-				continue
-			}
-			h.markUpstreamSuccess(target, startAt)
-			return resp, nil
-		}
-		h.markUpstreamFailure(target, err, startAt)
-		udpStart := time.Now()
-		resp, err = h.exchangeSingle(ctx, target, request)
-		if err == nil {
-			if blocked := h.responseBlockedIPCount(resp); blocked > 0 {
-				rejectErr := fmt.Errorf("dns response contains %d quarantined ip answer(s)", blocked)
-				h.markUpstreamFailure(target, rejectErr, udpStart)
-				lastErr = rejectErr
-				continue
-			}
-			h.markUpstreamSuccess(target, udpStart)
-			return resp, nil
-		}
-		h.markUpstreamFailure(target, err, udpStart)
-		lastErr = err
+		return nil, lastErr
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no dns upstream available")
-	}
-	return nil, lastErr
+	return resp, nil
 }
 
 func (h *dnsHijacker) exchangeTCP(ctx context.Context, destination M.Socksaddr, request []byte) ([]byte, error) {
@@ -416,31 +387,126 @@ func (h *dnsHijacker) exchangeTCP(ctx context.Context, destination M.Socksaddr, 
 		}
 		return nil, lastErr
 	}
+	resp, err := h.exchangePlainDNS(ctx, destination, request, false)
+	if err != nil {
+		if lastErr == nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("%v; %w", lastErr, err)
+		}
+		return nil, lastErr
+	}
+	return resp, nil
+}
 
+func (h *dnsHijacker) exchangePlainDNS(ctx context.Context, destination M.Socksaddr, request []byte, allowUDPFallback bool) ([]byte, error) {
 	targets := h.buildTargets(destination)
+	if len(targets) == 0 {
+		return nil, errors.New("no dns upstream available")
+	}
+
+	now := time.Now()
+	availableTargets := make([]string, 0, len(targets))
+	blockedTargets := make([]string, 0, len(targets))
 	for _, target := range targets {
-		if h.isUpstreamBlocked(target, time.Now()) {
+		if h.isUpstreamBlocked(target, now) {
+			blockedTargets = append(blockedTargets, target)
 			continue
 		}
-		startAt := time.Now()
-		resp, err := h.exchangeSingleTCP(ctx, target, request)
-		if err == nil {
+		availableTargets = append(availableTargets, target)
+	}
+
+	tryConcurrent := func(candidates []string) ([]byte, error) {
+		if len(candidates) == 0 {
+			return nil, errors.New("no dns upstream available")
+		}
+		if len(candidates) == 1 {
+			return h.exchangeSinglePlainTarget(ctx, candidates[0], request, allowUDPFallback)
+		}
+
+		parallel := len(candidates)
+		if parallel > 3 {
+			parallel = 3
+		}
+		type plainDNSResult struct {
+			resp []byte
+			err  error
+		}
+		raceCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		results := make(chan plainDNSResult, len(candidates))
+		sem := make(chan struct{}, parallel)
+		for _, target := range candidates {
+			target := target
+			go func() {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				resp, err := h.exchangeSinglePlainTarget(raceCtx, target, request, allowUDPFallback)
+				results <- plainDNSResult{resp: resp, err: err}
+			}()
+		}
+
+		var errOut error
+		for i := 0; i < len(candidates); i++ {
+			result := <-results
+			if result.err == nil && len(result.resp) > 0 {
+				cancel()
+				return result.resp, nil
+			}
+			if result.err != nil {
+				errOut = result.err
+			}
+		}
+		if errOut == nil {
+			errOut = errors.New("no dns upstream available")
+		}
+		return nil, errOut
+	}
+
+	if len(availableTargets) > 0 {
+		return tryConcurrent(availableTargets)
+	}
+	if len(blockedTargets) > 0 {
+		logrus.Warnf("[Client] dns upstreams are all blocked, force probing blocked targets: %d", len(blockedTargets))
+		return tryConcurrent(blockedTargets)
+	}
+	return nil, errors.New("no dns upstream available")
+}
+
+func (h *dnsHijacker) exchangeSinglePlainTarget(ctx context.Context, target string, request []byte, allowUDPFallback bool) ([]byte, error) {
+	// Prefer TCP to reduce UDP-based DNS poisoning/interception on some networks.
+	tcpStart := time.Now()
+	resp, err := h.exchangeSingleTCP(ctx, target, request)
+	if err == nil {
+		if blocked := h.responseBlockedIPCount(resp); blocked > 0 {
+			rejectErr := fmt.Errorf("dns response contains %d quarantined ip answer(s)", blocked)
+			h.markUpstreamFailure(target, rejectErr, tcpStart)
+			return nil, rejectErr
+		}
+		h.markUpstreamSuccess(target, tcpStart)
+		return resp, nil
+	}
+
+	if allowUDPFallback && shouldFallbackUDPDNSProbe(target, err.Error()) {
+		udpStart := time.Now()
+		resp, udpErr := h.exchangeSingle(ctx, target, request)
+		if udpErr == nil {
 			if blocked := h.responseBlockedIPCount(resp); blocked > 0 {
 				rejectErr := fmt.Errorf("dns response contains %d quarantined ip answer(s)", blocked)
-				h.markUpstreamFailure(target, rejectErr, startAt)
-				lastErr = rejectErr
-				continue
+				h.markUpstreamFailure(target, rejectErr, udpStart)
+				return nil, rejectErr
 			}
-			h.markUpstreamSuccess(target, startAt)
+			h.markUpstreamSuccess(target, udpStart)
 			return resp, nil
 		}
-		h.markUpstreamFailure(target, err, startAt)
-		lastErr = err
+		combined := fmt.Errorf("tcp: %v; udp: %w", err, udpErr)
+		h.markUpstreamFailure(target, combined, udpStart)
+		return nil, combined
 	}
-	if lastErr == nil {
-		lastErr = errors.New("no dns upstream available")
-	}
-	return nil, lastErr
+
+	h.markUpstreamFailure(target, err, tcpStart)
+	return nil, err
 }
 
 func (h *dnsHijacker) buildTargets(destination M.Socksaddr) []string {
@@ -530,8 +596,8 @@ func (h *dnsHijacker) exchangeSingleTCP(ctx context.Context, target string, requ
 func (h *dnsHijacker) exchangeDoH(ctx context.Context, request []byte) ([]byte, error) {
 	var lastErr error
 	blockedTargets := make([]dnsDoHUpstream, 0, len(h.doh))
-	attempted := false
-	for _, item := range h.doh {
+	availableTargets := make([]dnsDoHUpstream, 0, len(h.doh))
+	for _, item := range h.prioritizeDoHTargets(h.doh) {
 		if strings.TrimSpace(item.Addr) == "" || strings.TrimSpace(item.Server) == "" || strings.TrimSpace(item.URL) == "" {
 			continue
 		}
@@ -539,28 +605,85 @@ func (h *dnsHijacker) exchangeDoH(ctx context.Context, request []byte) ([]byte, 
 			blockedTargets = append(blockedTargets, item)
 			continue
 		}
-		attempted = true
-		startAt := time.Now()
-		resp, err := h.exchangeSingleDoH(ctx, item, request)
-		if err == nil {
-			h.markUpstreamSuccess(item.Addr, startAt)
+		availableTargets = append(availableTargets, item)
+	}
+
+	tryDoHConcurrent := func(candidates []dnsDoHUpstream) ([]byte, error) {
+		if len(candidates) == 0 {
+			return nil, errors.New("no doh upstream available")
+		}
+		if len(candidates) == 1 {
+			startAt := time.Now()
+			resp, err := h.exchangeSingleDoH(ctx, candidates[0], request)
+			if err != nil {
+				h.markUpstreamFailure(candidates[0].Addr, err, startAt)
+				return nil, err
+			}
+			h.markUpstreamSuccess(candidates[0].Addr, startAt)
 			return resp, nil
 		}
-		h.markUpstreamFailure(item.Addr, err, startAt)
+
+		parallel := len(candidates)
+		if parallel > 3 {
+			parallel = 3
+		}
+		type dohResult struct {
+			resp []byte
+			err  error
+		}
+		raceCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		results := make(chan dohResult, len(candidates))
+		sem := make(chan struct{}, parallel)
+
+		for _, item := range candidates {
+			item := item
+			go func() {
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				startAt := time.Now()
+				resp, err := h.exchangeSingleDoH(raceCtx, item, request)
+				if err != nil {
+					h.markUpstreamFailure(item.Addr, err, startAt)
+					results <- dohResult{err: err}
+					return
+				}
+				h.markUpstreamSuccess(item.Addr, startAt)
+				results <- dohResult{resp: resp}
+			}()
+		}
+
+		var errOut error
+		for i := 0; i < len(candidates); i++ {
+			result := <-results
+			if result.err == nil && len(result.resp) > 0 {
+				cancel()
+				return result.resp, nil
+			}
+			if result.err != nil {
+				errOut = result.err
+			}
+		}
+		if errOut == nil {
+			errOut = errors.New("no doh upstream available")
+		}
+		return nil, errOut
+	}
+
+	if len(availableTargets) > 0 {
+		resp, err := tryDoHConcurrent(availableTargets)
+		if err == nil {
+			return resp, nil
+		}
 		lastErr = err
 	}
-	if !attempted && len(blockedTargets) > 0 {
+	if len(availableTargets) == 0 && len(blockedTargets) > 0 {
 		logrus.Warnf("[Client] dns doh upstreams are all blocked, force probing blocked targets: %d", len(blockedTargets))
-		for _, item := range blockedTargets {
-			startAt := time.Now()
-			resp, err := h.exchangeSingleDoH(ctx, item, request)
-			if err == nil {
-				h.markUpstreamSuccess(item.Addr, startAt)
-				return resp, nil
-			}
-			h.markUpstreamFailure(item.Addr, err, startAt)
-			lastErr = err
+		resp, err := tryDoHConcurrent(blockedTargets)
+		if err == nil {
+			return resp, nil
 		}
+		lastErr = err
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no doh upstream available")
@@ -1066,6 +1189,28 @@ func (h *dnsHijacker) prioritizeTargets(targets []string) []string {
 	return out
 }
 
+func (h *dnsHijacker) prioritizeDoHTargets(targets []dnsDoHUpstream) []dnsDoHUpstream {
+	if h == nil || len(targets) <= 1 {
+		return targets
+	}
+	now := time.Now()
+	out := append([]dnsDoHUpstream(nil), targets...)
+	sort.SliceStable(out, func(i, j int) bool {
+		aBlocked := h.isUpstreamBlocked(out[i].Addr, now)
+		bBlocked := h.isUpstreamBlocked(out[j].Addr, now)
+		if aBlocked != bBlocked {
+			return !aBlocked && bBlocked
+		}
+		aFail := h.getUpstreamFailCount(out[i].Addr)
+		bFail := h.getUpstreamFailCount(out[j].Addr)
+		if aFail != bFail {
+			return aFail < bFail
+		}
+		return false
+	})
+	return out
+}
+
 func (h *dnsHijacker) ensureUpstreamHealthLocked(target string) *dnsUpstreamHealth {
 	if h.health == nil {
 		h.health = make(map[string]*dnsUpstreamHealth, len(h.upstreams))
@@ -1192,30 +1337,6 @@ func isDNSTimeoutLikeError(err error) bool {
 func defaultDoHUpstreams() []dnsDoHUpstream {
 	return []dnsDoHUpstream{
 		{
-			Name:    "cloudflare-v6",
-			Addr:    "[2606:4700:4700::1111]:443",
-			Server:  "cloudflare-dns.com",
-			Host:    "cloudflare-dns.com",
-			URL:     "https://cloudflare-dns.com/dns-query",
-			Timeout: 2500 * time.Millisecond,
-		},
-		{
-			Name:    "google-v6",
-			Addr:    "[2001:4860:4860::8888]:443",
-			Server:  "dns.google",
-			Host:    "dns.google",
-			URL:     "https://dns.google/dns-query",
-			Timeout: 2500 * time.Millisecond,
-		},
-		{
-			Name:    "quad9-v6",
-			Addr:    "[2620:fe::fe]:443",
-			Server:  "dns.quad9.net",
-			Host:    "dns.quad9.net",
-			URL:     "https://dns.quad9.net/dns-query",
-			Timeout: 2500 * time.Millisecond,
-		},
-		{
 			Name:    "cloudflare",
 			Addr:    "1.1.1.1:443",
 			Server:  "cloudflare-dns.com",
@@ -1234,6 +1355,30 @@ func defaultDoHUpstreams() []dnsDoHUpstream {
 		{
 			Name:    "quad9",
 			Addr:    "9.9.9.9:443",
+			Server:  "dns.quad9.net",
+			Host:    "dns.quad9.net",
+			URL:     "https://dns.quad9.net/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
+			Name:    "cloudflare-v6",
+			Addr:    "[2606:4700:4700::1111]:443",
+			Server:  "cloudflare-dns.com",
+			Host:    "cloudflare-dns.com",
+			URL:     "https://cloudflare-dns.com/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
+			Name:    "google-v6",
+			Addr:    "[2001:4860:4860::8888]:443",
+			Server:  "dns.google",
+			Host:    "dns.google",
+			URL:     "https://dns.google/dns-query",
+			Timeout: 2500 * time.Millisecond,
+		},
+		{
+			Name:    "quad9-v6",
+			Addr:    "[2620:fe::fe]:443",
 			Server:  "dns.quad9.net",
 			Host:    "dns.quad9.net",
 			URL:     "https://dns.quad9.net/dns-query",

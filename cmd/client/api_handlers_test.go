@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,105 @@ func TestHandleConfigPutSwitchAndPersist(t *testing.T) {
 	}
 	if reloaded.Failover == nil || reloaded.Failover.Enabled {
 		t.Fatalf("expected failover disabled: %+v", reloaded.Failover)
+	}
+}
+
+func TestHandleConfigPutDefaultNodeAutoSyncRoutingGroupEgress(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+
+	cfg := testClientConfig()
+	cfg.Nodes = append(cfg.Nodes, clientNodeConfig{
+		Name:     "node-2",
+		Server:   "node2.example.com:8443",
+		Password: "change-me-2",
+		SNI:      "node2.example.com",
+	})
+	cfg.Routing = &clientRoutingConfig{
+		Enabled:       true,
+		DefaultAction: "GROUP:节点选择",
+		GroupEgress: map[string]string{
+			"节点选择": "node-1",
+		},
+	}
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, loaded, configPath)
+
+	resp := doJSONRequest(t, http.MethodPut, "/api/v1/config", map[string]any{
+		"default_node": "node-2",
+	}, state.handleConfig)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	gotSynced, _ := out["routing_group_synced"].(string)
+	if got := strings.TrimSpace(gotSynced); got != "节点选择" {
+		t.Fatalf("expected routing_group_synced=节点选择, got %q", got)
+	}
+
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if reloaded.Routing == nil {
+		t.Fatalf("expected routing config persisted")
+	}
+	if got := strings.TrimSpace(reloaded.Routing.GroupEgress["节点选择"]); got != "node-2" {
+		t.Fatalf("expected 节点选择 synced to node-2, got %q", got)
+	}
+}
+
+func TestHandleSwitchAutoSyncRoutingGroupEgressInMemory(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+
+	cfg := testClientConfig()
+	cfg.Nodes = append(cfg.Nodes, clientNodeConfig{
+		Name:     "node-2",
+		Server:   "node2.example.com:8443",
+		Password: "change-me-2",
+		SNI:      "node2.example.com",
+	})
+	cfg.Routing = &clientRoutingConfig{
+		Enabled:       true,
+		DefaultAction: "GROUP:节点选择",
+		GroupEgress: map[string]string{
+			"节点选择": "node-1",
+		},
+	}
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, loaded, configPath)
+
+	resp := doJSONRequest(t, http.MethodPost, "/api/v1/switch", map[string]any{
+		"name": "node-2",
+	}, state.handleSwitch)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if state.manager.CurrentNodeName() != "node-2" {
+		t.Fatalf("expected current node switched to node-2, got %s", state.manager.CurrentNodeName())
+	}
+	if state.cfg.Routing == nil {
+		t.Fatalf("expected routing config exists")
+	}
+	if got := strings.TrimSpace(state.cfg.Routing.GroupEgress["节点选择"]); got != "node-2" {
+		t.Fatalf("expected in-memory 节点选择 synced to node-2, got %q", got)
 	}
 }
 
@@ -858,5 +958,88 @@ func TestHandleNodeExportByGroup(t *testing.T) {
 	}
 	if !strings.Contains(out.Text, "hk-1,anytls://") {
 		t.Fatalf("unexpected export text: %q", out.Text)
+	}
+}
+
+func TestHandleNodeCAStoreImportListDelete(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	state := newTestAPIState(t, loaded, configPath)
+
+	caPath := filepath.Join(dir, "tmp_import_ca.crt")
+	keyPath := filepath.Join(dir, "tmp_import_ca.key")
+	ca, err := loadOrCreateMITMCA(caPath, keyPath)
+	if err != nil {
+		t.Fatalf("generate ca failed: %v", err)
+	}
+
+	importResp := doJSONRequest(t, http.MethodPost, "/api/v1/node/ca", map[string]any{
+		"name":     "import-test-ca",
+		"cert_pem": string(ca.certPEMRaw),
+	}, state.handleNodeCAStore)
+	if importResp.Code != http.StatusOK {
+		t.Fatalf("unexpected import status: %d body=%s", importResp.Code, importResp.Body.String())
+	}
+	var importOut struct {
+		OK   bool `json:"ok"`
+		Item struct {
+			Name string `json:"name"`
+			Path string `json:"path"`
+		} `json:"item"`
+	}
+	if err := json.Unmarshal(importResp.Body.Bytes(), &importOut); err != nil {
+		t.Fatalf("decode import response failed: %v", err)
+	}
+	if !importOut.OK {
+		t.Fatalf("expected ok=true, got: %+v", importOut)
+	}
+	if importOut.Item.Name == "" || importOut.Item.Path == "" {
+		t.Fatalf("invalid import item: %+v", importOut.Item)
+	}
+	if !strings.Contains(importOut.Item.Path, filepath.Join("certs", "node-ca")) {
+		t.Fatalf("unexpected import path: %s", importOut.Item.Path)
+	}
+
+	listResp := doJSONRequest(t, http.MethodGet, "/api/v1/node/ca", nil, state.handleNodeCAStore)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("unexpected list status: %d body=%s", listResp.Code, listResp.Body.String())
+	}
+	var listOut struct {
+		Count int `json:"count"`
+		Items []struct {
+			Name string `json:"name"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listResp.Body.Bytes(), &listOut); err != nil {
+		t.Fatalf("decode list response failed: %v", err)
+	}
+	if listOut.Count < 1 || len(listOut.Items) < 1 {
+		t.Fatalf("expected imported item in list, got: %+v", listOut)
+	}
+
+	state.lock.Lock()
+	state.cfg.Nodes[0].CACertPath = importOut.Item.Path
+	state.lock.Unlock()
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v1/node/ca/"+url.PathEscape(importOut.Item.Name), nil)
+	deleteRec := httptest.NewRecorder()
+	state.handleNodeCAItem(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("expected conflict when cert in use, got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+
+	forceReq := httptest.NewRequest(http.MethodDelete, "/api/v1/node/ca/"+url.PathEscape(importOut.Item.Name)+"?force=1", nil)
+	forceRec := httptest.NewRecorder()
+	state.handleNodeCAItem(forceRec, forceReq)
+	if forceRec.Code != http.StatusOK {
+		t.Fatalf("unexpected force delete status: %d body=%s", forceRec.Code, forceRec.Body.String())
 	}
 }

@@ -3,13 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -445,6 +449,8 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 		return result, fmt.Errorf("subscription contains no valid nodes")
 	}
 
+	caMatcher := newSubscriptionNodeCAMatcher(filepath.Dir(strings.TrimSpace(s.configPath)))
+
 	existingSource := make(map[string]string, len(s.cfg.Nodes))
 	for _, n := range s.cfg.Nodes {
 		existingSource[n.Name] = n.SourceID
@@ -455,6 +461,11 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 		server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseNodeURI(item.URI)
 		if err != nil {
 			continue
+		}
+		if strings.TrimSpace(caCertPath) == "" && allowInsecure != nil && !*allowInsecure {
+			if autoPath, ok := caMatcher.Match(server, sni); ok {
+				caCertPath = autoPath
+			}
 		}
 		baseName := strings.TrimSpace(item.Name)
 		if baseName == "" {
@@ -498,6 +509,9 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 			removed = append(removed, n.Name)
 			continue
 		}
+		if strings.TrimSpace(next.CACertPath) == "" && strings.TrimSpace(n.CACertPath) != "" {
+			next.CACertPath = n.CACertPath
+		}
 		newNodes = append(newNodes, next)
 		delete(desired, n.Name)
 		result.Updated++
@@ -539,6 +553,11 @@ func (s *apiState) applySubscriptionNodesLocked(sub clientSubscription, items []
 			s.cfg.DefaultNode = s.cfg.Nodes[0].Name
 		}
 	}
+	syncTarget := strings.TrimSpace(s.cfg.DefaultNode)
+	if strings.TrimSpace(switchTarget) != "" {
+		syncTarget = strings.TrimSpace(switchTarget)
+	}
+	_, _ = s.syncDefaultRoutingGroupEgressLocked(syncTarget, "subscription-apply")
 
 	if err := saveClientConfig(s.configPath, s.cfg); err != nil {
 		return result, err
@@ -640,6 +659,11 @@ func (s *apiState) deleteSubscriptionLocked(id string) error {
 			s.cfg.DefaultNode = s.cfg.Nodes[0].Name
 		}
 	}
+	syncTarget := strings.TrimSpace(s.cfg.DefaultNode)
+	if strings.TrimSpace(switchTarget) != "" {
+		syncTarget = strings.TrimSpace(switchTarget)
+	}
+	_, _ = s.syncDefaultRoutingGroupEgressLocked(syncTarget, "subscription-delete")
 
 	if err := saveClientConfig(s.configPath, s.cfg); err != nil {
 		return err
@@ -1441,6 +1465,8 @@ func parseKVAnyTLSNode(kv map[string]string) (subscriptionNodeItem, string) {
 	sni := strings.TrimSpace(firstNonEmpty(kv, "sni", "servername", "server-name", "server_name", "tls-server-name", "tls_server_name"))
 	egressIP := strings.TrimSpace(firstNonEmpty(kv, "egress-ip", "egress_ip"))
 	egressRule := strings.TrimSpace(firstNonEmpty(kv, "egress-rule", "egress_rule"))
+	allowInsecure := parseOptionalBoolString(strings.TrimSpace(firstNonEmpty(kv, "allow-insecure", "skip-cert-verify", "insecure")))
+	caCertPath := strings.TrimSpace(firstNonEmpty(kv, "ca-cert-path", "ca-cert", "ca-cert-file", "ca"))
 	if server == "" || portRaw == "" || password == "" {
 		return subscriptionNodeItem{}, "invalid"
 	}
@@ -1449,7 +1475,7 @@ func parseKVAnyTLSNode(kv map[string]string) (subscriptionNodeItem, string) {
 		return subscriptionNodeItem{}, "invalid"
 	}
 	hostPort := joinHostPortLoose(server, port)
-	uri, err := buildAnyTLSURI(hostPort, password, sni, egressIP, egressRule)
+	uri, err := buildAnyTLSURI(hostPort, password, sni, egressIP, egressRule, allowInsecure, caCertPath)
 	if err != nil {
 		return subscriptionNodeItem{}, "invalid"
 	}
@@ -2038,7 +2064,7 @@ func normalizeSecurityValue(raw string) string {
 	}
 }
 
-func buildAnyTLSURI(server, password, sni, egressIP, egressRule string) (string, error) {
+func buildAnyTLSURI(server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string) (string, error) {
 	server = strings.TrimSpace(server)
 	password = strings.TrimSpace(password)
 	if server == "" || password == "" {
@@ -2059,8 +2085,187 @@ func buildAnyTLSURI(server, password, sni, egressIP, egressRule string) (string,
 	if strings.TrimSpace(egressRule) != "" {
 		q.Set("egress-rule", strings.TrimSpace(egressRule))
 	}
+	if allowInsecure != nil {
+		if *allowInsecure {
+			q.Set("insecure", "1")
+		} else {
+			q.Set("insecure", "0")
+		}
+	}
+	if strings.TrimSpace(caCertPath) != "" {
+		q.Set("ca-cert-path", strings.TrimSpace(caCertPath))
+	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+type subscriptionNodeCAEntry struct {
+	Path    string
+	Name    string
+	CN      string
+	DNS     []string
+	IsCA    bool
+	Expired bool
+}
+
+type subscriptionNodeCAMatcher struct {
+	entries []subscriptionNodeCAEntry
+}
+
+func newSubscriptionNodeCAMatcher(configDir string) *subscriptionNodeCAMatcher {
+	storeDir := nodeCAStoreDir(configDir)
+	items, err := listNodeCAItems(storeDir, nil)
+	if err != nil || len(items) == 0 {
+		return &subscriptionNodeCAMatcher{}
+	}
+	entries := make([]subscriptionNodeCAEntry, 0, len(items))
+	for _, item := range items {
+		path := strings.TrimSpace(item.Path)
+		if path == "" {
+			continue
+		}
+		cn, dns, isCA := loadNodeCANameHints(path)
+		entries = append(entries, subscriptionNodeCAEntry{
+			Path:    path,
+			Name:    strings.ToLower(strings.TrimSpace(item.Name)),
+			CN:      strings.ToLower(strings.TrimSpace(cn)),
+			DNS:     dns,
+			IsCA:    isCA,
+			Expired: item.IsExpired,
+		})
+	}
+	return &subscriptionNodeCAMatcher{entries: entries}
+}
+
+func loadNodeCANameHints(path string) (cn string, dns []string, isCA bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", nil, false
+	}
+	rest := raw
+	for {
+		block, next := pem.Decode(rest)
+		if block == nil {
+			return "", nil, false
+		}
+		rest = next
+		if !strings.EqualFold(strings.TrimSpace(block.Type), "CERTIFICATE") {
+			continue
+		}
+		cert, parseErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil {
+			return "", nil, false
+		}
+		names := make([]string, 0, len(cert.DNSNames))
+		for _, name := range cert.DNSNames {
+			n := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(name, ".")))
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+		return cert.Subject.CommonName, names, cert.IsCA
+	}
+}
+
+func (m *subscriptionNodeCAMatcher) Match(server, sni string) (string, bool) {
+	if m == nil || len(m.entries) == 0 {
+		return "", false
+	}
+	host := strings.TrimSpace(sni)
+	if host == "" {
+		if h, _, err := net.SplitHostPort(strings.TrimSpace(server)); err == nil {
+			host = h
+		} else {
+			host = strings.TrimSpace(server)
+		}
+	}
+	host = strings.ToLower(strings.TrimSpace(strings.Trim(host, "[]")))
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return "", false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return "", false
+	}
+
+	bestIdx := -1
+	bestScore := -1
+	for i, entry := range m.entries {
+		if !entry.IsCA {
+			continue
+		}
+		score := 0
+		for _, name := range entry.DNS {
+			if matchHostnamePattern(host, name) {
+				score = 120
+				break
+			}
+		}
+		if score == 0 && entry.CN != "" && matchHostnamePattern(host, entry.CN) {
+			score = 110
+		}
+		if score == 0 && matchCANameHint(host, entry.Name) {
+			score = 80
+		}
+		if score > 0 && !entry.Expired {
+			score += 5
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 && bestScore > 0 {
+		return m.entries[bestIdx].Path, true
+	}
+	return "", false
+}
+
+func matchHostnamePattern(host, pattern string) bool {
+	host = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+	pattern = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(pattern, ".")))
+	if host == "" || pattern == "" {
+		return false
+	}
+	if host == pattern {
+		return true
+	}
+	if !strings.HasPrefix(pattern, "*.") {
+		return false
+	}
+	suffix := strings.TrimPrefix(pattern, "*.")
+	if suffix == "" || host == suffix {
+		return false
+	}
+	return strings.HasSuffix(host, "."+suffix)
+}
+
+func hostSuffix(host string) string {
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.Join(parts[len(parts)-2:], ".")
+}
+
+func matchCANameHint(host, rawName string) bool {
+	host = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+	name := strings.ToLower(strings.TrimSpace(rawName))
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	name = strings.TrimSpace(strings.Trim(name, "."))
+	if host == "" || name == "" {
+		return false
+	}
+	if host == name {
+		return true
+	}
+	if suffix := hostSuffix(host); suffix != "" && suffix == name {
+		return true
+	}
+	if strings.Count(name, ".") >= 1 && strings.HasSuffix(host, "."+name) {
+		return true
+	}
+	return false
 }
 
 func joinHostPortLoose(host string, port int) string {

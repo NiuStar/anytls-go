@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -195,6 +196,42 @@ proxies:
 	}
 	if server != "1.2.3.4:443" || password != "pass@@" || sni != "hk.example.com" {
 		t.Fatalf("unexpected node fields: server=%q password=%q sni=%q", server, password, sni)
+	}
+}
+
+func TestParseSubscriptionClashAnyTLSStrictVerify(t *testing.T) {
+	raw := `
+proxies:
+  - name: strict-anytls
+    type: anytls
+    server: 154.64.236.96
+    port: 44006
+    password: Wangzai007..@@
+    sni: 30js.n4yehjos.docker.com
+    skip-cert-verify: false
+    allow-insecure: false
+    insecure: false
+    ca-cert-path: /tmp/anytls-test-ca.crt
+`
+	items, warning, sourceFmt := parseSubscriptionContent([]byte(raw))
+	if warning != "" {
+		t.Fatalf("unexpected warning: %q", warning)
+	}
+	if sourceFmt != "clash" {
+		t.Fatalf("unexpected source format: %q", sourceFmt)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	_, _, _, _, _, allowInsecure, caCertPath, err := parseAnyTLSURIWithOptions(items[0].URI)
+	if err != nil {
+		t.Fatalf("parse anytls uri with options failed: %v", err)
+	}
+	if allowInsecure == nil || *allowInsecure {
+		t.Fatalf("expected allow_insecure=false, got %#v uri=%q", allowInsecure, items[0].URI)
+	}
+	if caCertPath != "/tmp/anytls-test-ca.crt" {
+		t.Fatalf("unexpected ca cert path: %q uri=%q", caCertPath, items[0].URI)
 	}
 }
 
@@ -570,5 +607,59 @@ func TestApplySubscriptionNodesLockedAssignGroups(t *testing.T) {
 	}
 	if _, ok := seen["节点选择"]; !ok {
 		t.Fatalf("missing group 节点选择: %#v", node.Groups)
+	}
+}
+
+func TestApplySubscriptionNodesLockedAutoMatchNodeCA(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, loaded, configPath)
+
+	caTmpPath := filepath.Join(dir, "tmp_node_ca.crt")
+	caKeyPath := filepath.Join(dir, "tmp_node_ca.key")
+	ca, err := loadOrCreateMITMCA(caTmpPath, caKeyPath)
+	if err != nil {
+		t.Fatalf("generate ca failed: %v", err)
+	}
+	storeDir := nodeCAStoreDir(dir)
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
+		t.Fatalf("mkdir store dir failed: %v", err)
+	}
+	storeCAPath := filepath.Join(storeDir, "example.com.crt")
+	if err := os.WriteFile(storeCAPath, ca.certPEMRaw, 0644); err != nil {
+		t.Fatalf("write store ca failed: %v", err)
+	}
+
+	sub := clientSubscription{
+		ID:                "sub-auto-ca",
+		Name:              "auto-ca",
+		URL:               "https://example.com/sub.txt",
+		Enabled:           true,
+		UpdateIntervalSec: 3600,
+		NodePrefix:        "auto-ca",
+	}
+	items := []subscriptionNodeItem{
+		{Name: "strict-node", URI: "anytls://pass@1.2.3.4:443/?sni=example.com&insecure=0"},
+	}
+	if _, err := state.applySubscriptionNodesLocked(sub, items); err != nil {
+		t.Fatalf("apply subscription nodes failed: %v", err)
+	}
+	node, ok := findNodeByName(state.cfg.Nodes, "strict-node")
+	if !ok {
+		t.Fatalf("expected imported strict-node")
+	}
+	if node.AllowInsecure == nil || *node.AllowInsecure {
+		t.Fatalf("expected allow_insecure=false, got %#v", node.AllowInsecure)
+	}
+	if normalizePathKey(node.CACertPath) != normalizePathKey(storeCAPath) {
+		t.Fatalf("expected auto matched ca path %q, got %q", storeCAPath, node.CACertPath)
 	}
 }

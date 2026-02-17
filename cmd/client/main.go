@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strconv"
@@ -217,6 +218,7 @@ func installForceInterruptHandler(cancel context.CancelFunc) func() {
 	go func() {
 		defer close(done)
 		first := <-sigCh
+		logSignalContext("[Client] signal context", first)
 		logrus.Warnf("[Client] received signal %s, shutting down...", first.String())
 		cancel()
 
@@ -224,6 +226,7 @@ func installForceInterruptHandler(cancel context.CancelFunc) func() {
 		defer timer.Stop()
 		select {
 		case second := <-sigCh:
+			logSignalContext("[Client] second signal context", second)
 			logrus.Warnf("[Client] received second signal %s, force exiting", second.String())
 			os.Exit(130)
 		case <-timer.C:
@@ -236,6 +239,69 @@ func installForceInterruptHandler(cancel context.CancelFunc) func() {
 		default:
 		}
 	}
+}
+
+func logSignalContext(prefix string, sig os.Signal) {
+	pid := os.Getpid()
+	ppid := os.Getppid()
+	exePath, _ := os.Executable()
+	parentUser, parentCmd := lookupProcessMeta(ppid)
+	fields := logrus.Fields{
+		"signal":                 signalNameWithNumber(sig),
+		"signal_sender_pid":      "unknown",
+		"signal_sender_hint":     "Go signal API does not expose sender pid; check parent process and shell history",
+		"pid":                    pid,
+		"ppid":                   ppid,
+		"exe":                    strings.TrimSpace(exePath),
+		"args":                   strings.Join(os.Args, " "),
+		"goos":                   runtime.GOOS,
+		"goarch":                 runtime.GOARCH,
+		"parent_user":            parentUser,
+		"parent_command":         parentCmd,
+		"env_sudo_user":          strings.TrimSpace(os.Getenv("SUDO_USER")),
+		"env_launchd_label":      strings.TrimSpace(os.Getenv("LAUNCH_JOB_LABEL")),
+		"env_invocation_id":      strings.TrimSpace(os.Getenv("INVOCATION_ID")),
+		"env_systemd_invocation": strings.TrimSpace(os.Getenv("SYSTEMD_INVOCATION_ID")),
+	}
+	logrus.WithFields(fields).Warn(prefix)
+}
+
+func signalNameWithNumber(sig os.Signal) string {
+	if sig == nil {
+		return ""
+	}
+	if s, ok := sig.(syscall.Signal); ok {
+		return fmt.Sprintf("%s(%d)", s.String(), int(s))
+	}
+	return sig.String()
+}
+
+func lookupProcessMeta(pid int) (user, command string) {
+	if pid <= 0 {
+		return "", ""
+	}
+	rawUser, errUser := exec.Command("ps", "-o", "user=", "-p", strconv.Itoa(pid)).Output()
+	rawCmd, errCmd := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	if errUser == nil {
+		user = strings.TrimSpace(string(rawUser))
+	}
+	if errCmd == nil {
+		command = strings.TrimSpace(string(rawCmd))
+	}
+	if errUser != nil || errCmd != nil {
+		msg := make([]string, 0, 2)
+		if errUser != nil {
+			msg = append(msg, "user="+errUser.Error())
+		}
+		if errCmd != nil {
+			msg = append(msg, "cmd="+errCmd.Error())
+		}
+		logrus.WithFields(logrus.Fields{
+			"pid":   pid,
+			"error": strings.Join(msg, "; "),
+		}).Debug("[Client] lookup process meta failed")
+	}
+	return user, command
 }
 
 func runWithConfig(ctx context.Context, configPath string, listen *string, minIdleSession *int, controlAddr, controlCmd, nodeName, nodeURI *string) {
@@ -495,7 +561,7 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 
 	return NewMyClient(ctx, func(ctx context.Context) (net.Conn, error) {
 		dialUpstream := func() (net.Conn, error) {
-			return proxy.SystemDialer.DialContext(ctx, "tcp", node.Server)
+			return dialUpstreamTCP(ctx, node.Server)
 		}
 
 		conn, err := dialUpstream()
@@ -585,7 +651,7 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		handshakeCtx := ctx
 		cancel := func() {}
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-			handshakeCtx, cancel = context.WithTimeout(ctx, 8*time.Second)
+			handshakeCtx, cancel = context.WithTimeout(ctx, tlsClientHandshakeTimeout())
 		}
 		defer cancel()
 		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
@@ -594,6 +660,140 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		}
 		return tlsConn, nil
 	}, minIdleSession, node.EgressIP, node.EgressRule, node.Password, label), nil
+}
+
+func tlsClientHandshakeTimeout() time.Duration {
+	const (
+		defaultMS = 10000
+		minMS     = 3000
+		maxMS     = 30000
+	)
+	raw := strings.TrimSpace(os.Getenv("ANYTLS_TLS_HANDSHAKE_TIMEOUT_MS"))
+	if raw == "" {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	if ms < minMS {
+		ms = minMS
+	}
+	if ms > maxMS {
+		ms = maxMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func dialUpstreamTCP(ctx context.Context, server string) (net.Conn, error) {
+	if !enableUpstreamHedgedDial() {
+		return proxy.SystemDialer.DialContext(ctx, "tcp", server)
+	}
+	// Keep Linux/OpenWrt path conservative to avoid interacting with route-repair logic.
+	if runtime.GOOS == "linux" {
+		return proxy.SystemDialer.DialContext(ctx, "tcp", server)
+	}
+
+	delay := upstreamHedgedDelay()
+	if deadline, ok := ctx.Deadline(); ok {
+		remain := time.Until(deadline)
+		if remain <= delay+250*time.Millisecond {
+			return proxy.SystemDialer.DialContext(ctx, "tcp", server)
+		}
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan dialResult, 2)
+	dialAttempt := func(wait time.Duration) {
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-raceCtx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+			}
+		}
+		conn, err := proxy.SystemDialer.DialContext(raceCtx, "tcp", server)
+		if err == nil && conn != nil {
+			select {
+			case results <- dialResult{conn: conn}:
+				return
+			case <-raceCtx.Done():
+				_ = conn.Close()
+				return
+			}
+		}
+		select {
+		case results <- dialResult{err: err}:
+		case <-raceCtx.Done():
+		}
+	}
+
+	go dialAttempt(0)
+	go dialAttempt(delay)
+
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err == nil && result.conn != nil {
+			cancel()
+			return result.conn, nil
+		}
+		if result.err != nil {
+			lastErr = result.err
+		}
+	}
+	if lastErr == nil {
+		lastErr = context.DeadlineExceeded
+	}
+	return nil, lastErr
+}
+
+func enableUpstreamHedgedDial() bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("ANYTLS_UPSTREAM_HEDGED_DIAL")))
+	switch raw {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func upstreamHedgedDelay() time.Duration {
+	const (
+		defaultMS = 250
+		minMS     = 50
+		maxMS     = 1000
+	)
+	raw := strings.TrimSpace(os.Getenv("ANYTLS_UPSTREAM_HEDGED_DELAY_MS"))
+	if raw == "" {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil {
+		return time.Duration(defaultMS) * time.Millisecond
+	}
+	if ms < minMS {
+		ms = minMS
+	}
+	if ms > maxMS {
+		ms = maxMS
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func parseAllowInsecureFlag(raw string) (*bool, error) {

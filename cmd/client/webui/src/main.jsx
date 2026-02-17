@@ -8,15 +8,15 @@ import "./style.css";
 const { useEffect, useMemo, useRef, useState } = React;
 const {
   Layout, Typography, Card, Space, Button, Table, Tag, Form, Input, InputNumber, Switch, Checkbox,
-  Modal, Tabs, message, Popconfirm, Alert, Divider, Tooltip, Select, Descriptions,
+  Modal, Tabs, message, Popconfirm, Alert, Divider, Tooltip, Select, Descriptions, AutoComplete,
 } = antd;
 
 const WEB_AUTH_STORAGE_KEY = "anytls_web_auth_v1";
 const WEB_AUTH_SESSION_KEY = "anytls_web_auth_session_v1";
 const PROBE_RESULT_STORAGE_PREFIX = "anytls_probe_results_v1";
 const DEFAULT_API_TIMEOUT_MS = 15000;
-const LATENCY_PROBE_TIMEOUT_DEFAULT_MS = 2000;
-const LATENCY_PROBE_TIMEOUT_MAX_MS = 2000;
+const LATENCY_PROBE_TIMEOUT_DEFAULT_MS = 3000;
+const LATENCY_PROBE_TIMEOUT_MAX_MS = 10000;
 const BANDWIDTH_PROBE_TIMEOUT_DEFAULT_MS = 20000;
 const BANDWIDTH_PROBE_TIMEOUT_MIN_MS = 200;
 const BANDWIDTH_PROBE_TIMEOUT_MAX_MS = 120000;
@@ -258,11 +258,12 @@ function parseDateInput(raw) {
     return null;
   }
   let normalized = value;
-  // Legacy values without timezone are treated as UTC to avoid host timezone drift.
+  // Legacy values without timezone are emitted by backend in local runtime timezone.
+  // UI displays fixed CST, so parse legacy values as CST to avoid +8h double shift.
   if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(normalized)) {
-    normalized = `${normalized.replace(" ", "T")}Z`;
+    normalized = `${normalized.replace(" ", "T")}+08:00`;
   } else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(normalized)) {
-    normalized = `${normalized}Z`;
+    normalized = `${normalized}+08:00`;
   }
   const date = new Date(normalized);
   if (Number.isNaN(date.getTime())) {
@@ -1394,6 +1395,8 @@ function App() {
   const [tunDNSRepairLoading, setTunDNSRepairLoading] = useState(false);
   const [routeSelfHealLoading, setRouteSelfHealLoading] = useState(false);
   const [routeSelfHealRaw, setRouteSelfHealRaw] = useState(null);
+  const [routeOSProbeLoading, setRouteOSProbeLoading] = useState(false);
+  const [routeOSProbeRaw, setRouteOSProbeRaw] = useState(null);
   const [exportingSelfHealReport, setExportingSelfHealReport] = useState(false);
   const [backupVisible, setBackupVisible] = useState(false);
   const [backupRows, setBackupRows] = useState([]);
@@ -1449,6 +1452,10 @@ function App() {
   const [browserProbeResult, setBrowserProbeResult] = useState(null);
   const [browserProbeLoadingByNode, setBrowserProbeLoadingByNode] = useState({});
   const [browserProbeResultByNode, setBrowserProbeResultByNode] = useState({});
+  const [nodeCAItems, setNodeCAItems] = useState([]);
+  const [nodeCALoading, setNodeCALoading] = useState(false);
+  const [nodeCAImporting, setNodeCAImporting] = useState(false);
+  const [nodeCADeleting, setNodeCADeleting] = useState({});
   const [routingHitsLoading, setRoutingHitsLoading] = useState(false);
   const [routingHits, setRoutingHits] = useState([]);
   const [routingHitsStats, setRoutingHitsStats] = useState(null);
@@ -1468,6 +1475,7 @@ function App() {
   const [mitmCheckingCA, setMitmCheckingCA] = useState(false);
   const [mitmInstallingCA, setMitmInstallingCA] = useState(false);
   const [mitmCAStatus, setMitmCAStatus] = useState(null);
+  const nodeCAFileInputRef = useRef(null);
 
   const [loginForm] = Form.useForm();
   const [configForm] = Form.useForm();
@@ -1536,6 +1544,16 @@ function App() {
     });
     return out;
   }, [nodes]);
+  const nodeCAPathOptions = useMemo(() => (
+    (nodeCAItems || []).map((item) => {
+      const name = String(item?.name || "").trim();
+      const path = String(item?.path || "").trim();
+      return {
+        value: path,
+        label: name ? `${name} (${path})` : path,
+      };
+    })
+  ), [nodeCAItems]);
   const groupActionNodes = useMemo(() => {
     const group = String(nodeGroupAction || "").trim();
     if (!group) {
@@ -1884,6 +1902,7 @@ function App() {
       await refreshStatus();
       await loadMITMCAStatus({silent: true});
       await loadRoutingProviders();
+      await loadNodeCAStore({silent: true});
     } catch (err) {
       if (err?.status !== 401) {
         message.error(`加载失败: ${err.message}`);
@@ -1921,6 +1940,111 @@ function App() {
     } finally {
       setMitmCheckingCA(false);
     }
+  }
+
+  async function loadNodeCAStore(options = {}) {
+    const {silent = false} = options;
+    setNodeCALoading(true);
+    try {
+      const res = await api("/api/v1/node/ca");
+      setNodeCAItems(Array.isArray(res?.items) ? res.items : []);
+      return Array.isArray(res?.items) ? res.items : [];
+    } catch (err) {
+      setNodeCAItems([]);
+      if (!silent) {
+        message.error(`加载节点 CA 列表失败: ${err.message}`);
+      }
+      return [];
+    } finally {
+      setNodeCALoading(false);
+    }
+  }
+
+  function openNodeCAFilePicker() {
+    const el = nodeCAFileInputRef.current;
+    if (!el) {
+      message.error("文件选择器不可用");
+      return;
+    }
+    el.click();
+  }
+
+  async function handleNodeCAFileImport(event) {
+    const input = event?.target;
+    const file = input?.files?.[0];
+    if (!file) {
+      return;
+    }
+    setNodeCAImporting(true);
+    try {
+      const text = await file.text();
+      const res = await api("/api/v1/node/ca", {
+        method: "POST",
+        body: JSON.stringify({
+          name: file.name || "",
+          cert_pem: text,
+        }),
+      });
+      const path = String(res?.item?.path || "").trim();
+      message.success(path ? `CA 导入成功: ${path}` : "CA 导入成功");
+      await loadNodeCAStore({silent: true});
+    } catch (err) {
+      message.error(`CA 导入失败: ${err.message}`);
+    } finally {
+      setNodeCAImporting(false);
+      if (input) {
+        input.value = "";
+      }
+    }
+  }
+
+  async function deleteNodeCA(item, force = false) {
+    const name = String(item?.name || "").trim();
+    if (!name) {
+      return;
+    }
+    setNodeCADeleting((prev) => ({...prev, [name]: true}));
+    try {
+      await api(`/api/v1/node/ca/${encodeURIComponent(name)}${force ? "?force=1" : ""}`, {
+        method: "DELETE",
+      });
+      message.success(`已删除 CA: ${name}`);
+      await loadNodeCAStore({silent: true});
+      if (editVisible && String(editForm.getFieldValue("ca_cert_path") || "").trim() === String(item?.path || "").trim()) {
+        editForm.setFieldValue("ca_cert_path", "");
+      }
+      if (addNodeVisible && String(manualForm.getFieldValue("ca_cert_path") || "").trim() === String(item?.path || "").trim()) {
+        manualForm.setFieldValue("ca_cert_path", "");
+      }
+    } catch (err) {
+      if (!force && String(err?.message || "").includes("force=1")) {
+        Modal.confirm({
+          title: "该证书正在被节点使用",
+          content: "继续强制删除会导致引用该证书的节点握手失败，确认继续？",
+          okText: "强制删除",
+          okButtonProps: {danger: true},
+          onOk: () => deleteNodeCA(item, true),
+        });
+        return;
+      }
+      message.error(`删除 CA 失败: ${err.message}`);
+    } finally {
+      setNodeCADeleting((prev) => {
+        const next = {...prev};
+        delete next[name];
+        return next;
+      });
+    }
+  }
+
+  function applyNodeCAPathToForms(path) {
+    const value = String(path || "").trim();
+    if (!value) {
+      return;
+    }
+    manualForm.setFieldValue("ca_cert_path", value);
+    editForm.setFieldValue("ca_cert_path", value);
+    message.success("已填入 CA 证书路径到节点表单");
   }
 
   async function autoInstallMITMCA() {
@@ -3324,6 +3448,31 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     }
   }
 
+  function formatLatencyProbeFailure(name, item, detailed) {
+    const nodeName = String(name || "").trim() || "-";
+    const errText = String(item?.error || "").trim() || "all probes failed";
+    if (!detailed) {
+      return `${nodeName}: ${errText}`;
+    }
+    const lines = [`${nodeName}: ${errText}`];
+    const attempts = Array.isArray(item?.attempts) ? item.attempts : [];
+    attempts.forEach((attempt) => {
+      if (!attempt || typeof attempt !== "object") {
+        return;
+      }
+      const round = Number(attempt.round || 0);
+      const tryNo = Number(attempt.try || 0);
+      const duration = Number(attempt.duration_ms || 0);
+      const ok = !!attempt.ok;
+      const err = String(attempt.error || "").trim();
+      const roundText = round > 0 ? round : "-";
+      const tryText = tryNo > 0 ? tryNo : "-";
+      const durationText = Number.isFinite(duration) && duration > 0 ? `${duration.toFixed(2)}ms` : "-";
+      lines.push(`[round ${roundText} try ${tryText}] ${ok ? "ok" : "fail"} ${durationText}${err ? ` ${err}` : ""}`);
+    });
+    return lines.join("\n");
+  }
+
   async function runLatency(names) {
     if (latencyTask.running || bandwidthTask.running) {
       message.warning("已有测速任务在执行，请稍候");
@@ -3342,6 +3491,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       return;
     }
     const failed = [];
+    const showDetailedFailure = targetNames.length === 1;
     setLatencyTask({running: true, current: 0, total: targetNames.length});
     try {
       for (let i = 0; i < targetNames.length; i += 1) {
@@ -3365,7 +3515,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           }
           if (item.error) {
             setLatencyResult((prev) => ({...prev, [name]: "失败"}));
-            failed.push(`${name}: ${item.error}`);
+            failed.push(formatLatencyProbeFailure(name, item, showDetailedFailure));
           } else if (item.avg_ms) {
             setLatencyResult((prev) => ({...prev, [name]: `${item.avg_ms.toFixed(2)} ms`}));
           } else {
@@ -3381,7 +3531,9 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       if (failed.length > 0) {
         Modal.error({
           title: "延迟测速失败",
-          content: failed.join("; "),
+          content: showDetailedFailure ? (
+            <pre style={{margin: 0, whiteSpace: "pre-wrap"}}>{failed.join("\n\n")}</pre>
+          ) : failed.join("; "),
         });
       }
     } catch (err) {
@@ -3913,6 +4065,22 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     }
   }
 
+  async function loadRouteOSProbe() {
+    if (!ensureTunTaskIdle("执行系统路由快照")) {
+      return;
+    }
+    setRouteOSProbeLoading(true);
+    try {
+      const res = await api("/api/v1/route/os_probe", {timeoutMS: 90000});
+      setRouteOSProbeRaw(res || null);
+      message.success("系统路由快照已完成");
+    } catch (err) {
+      message.error(`系统路由快照失败: ${err.message}`);
+    } finally {
+      setRouteOSProbeLoading(false);
+    }
+  }
+
   async function runTunCheckTaskForReport() {
     const taskID = await createAsyncTask("tun_check", {
       force_current_node: !!tunCheckForceCurrentNode,
@@ -3976,10 +4144,36 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       generated_at: new Date().toISOString(),
       runtime_status: runtimeStatus || null,
       route_selfheal: routeSelfHealRaw || null,
+      route_os_probe: routeOSProbeRaw || null,
       tun_check: tunCheckSnapshot || null,
       diagnose: diagnoseRaw || null,
       route_check: routeCheckRaw || null,
     };
+  }
+
+  function renderRouteOSProbeCommandCard(title, probe, key) {
+    if (!probe || typeof probe !== "object") {
+      return null;
+    }
+    const command = String(probe.command || "").trim();
+    const output = String(probe.output || "").trim();
+    const error = String(probe.error || "").trim();
+    const iface = String(probe.interface || "").trim();
+    const gateway = String(probe.gateway || "").trim();
+    return (
+      <Card key={key || title} size="small" title={title}>
+        <Space style={{marginBottom: 8}} wrap>
+          <Tag color={probe.ok ? "blue" : "red"}>{probe.ok ? "OK" : "FAIL"}</Tag>
+          {command ? <Typography.Text code>{command}</Typography.Text> : null}
+          {iface ? <Tag>iface: {iface}</Tag> : null}
+          {gateway ? <Tag color="blue">gw: {gateway}</Tag> : null}
+        </Space>
+        {error ? <Alert style={{marginBottom: 8}} type="error" showIcon message={error} /> : null}
+        <Typography.Paragraph copyable style={{whiteSpace: "pre-wrap", marginBottom: 0}}>
+          {output || "-"}
+        </Typography.Paragraph>
+      </Card>
+    );
   }
 
   function downloadReport(filename, content, mimeType) {
@@ -4110,6 +4304,17 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       (healHealth?.issues || []).forEach((item) => {
         lines.push(`- ${item}`);
       });
+      lines.push("");
+
+      const osProbeSummary = routeOSProbeRaw?.summary || {};
+      const osProbeNotes = Array.isArray(osProbeSummary?.notes) ? osProbeSummary.notes : [];
+      lines.push(`[OS Route Probe] ok=${osProbeSummary?.ok ? "true" : "false"} command_failures=${toPositiveInt(osProbeSummary?.command_failures)}`);
+      lines.push(`- current=${routeOSProbeRaw?.current || "-"}`);
+      lines.push(`- server=${routeOSProbeRaw?.server || "-"}`);
+      lines.push(`- active_iface=${routeOSProbeRaw?.tun?.active_iface || "-"}`);
+      if (osProbeNotes.length > 0) {
+        osProbeNotes.forEach((item) => lines.push(`- note: ${item}`));
+      }
       lines.push("");
 
       const tunSummary = tunCheckSnapshot?.summary || {};
@@ -5331,6 +5536,133 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                           </Button>
                         </Popconfirm>
                       </Space>
+                      <Card
+                        size="small"
+                        style={{marginBottom: 12}}
+                        title="节点 TLS CA 证书库"
+                        extra={(
+                          <Space wrap>
+                            <Button size="small" onClick={() => loadNodeCAStore()} loading={nodeCALoading}>刷新</Button>
+                            <Button size="small" type="dashed" onClick={openNodeCAFilePicker} loading={nodeCAImporting}>导入 CA</Button>
+                          </Space>
+                        )}
+                      >
+                        <input
+                          ref={nodeCAFileInputRef}
+                          type="file"
+                          accept=".crt,.pem,.cer"
+                          style={{display: "none"}}
+                          onChange={handleNodeCAFileImport}
+                        />
+                        {isMobile ? (
+                          <Space direction="vertical" style={{display: "flex"}} className="mobile-list">
+                            {(nodeCAItems || []).map((item) => (
+                              <Card key={`node-ca-mobile-${item.name}`} size="small">
+                                <Space style={{width: "100%", justifyContent: "space-between"}} wrap>
+                                  <Typography.Text strong>{item.name}</Typography.Text>
+                                  {item?.is_expired ? <Tag color="red">已过期</Tag> : <Tag color="green">有效</Tag>}
+                                </Space>
+                                <div style={{marginTop: 8}}>
+                                  <Typography.Text type="secondary">路径: {item.path || "-"}</Typography.Text>
+                                  <br />
+                                  <Typography.Text type="secondary">指纹: {String(item.fingerprint || "").slice(0, 16)}...</Typography.Text>
+                                  <br />
+                                  <Typography.Text type="secondary">引用节点: {Array.isArray(item.used_by) && item.used_by.length > 0 ? item.used_by.join(", ") : "-"}</Typography.Text>
+                                </div>
+                                <Space style={{marginTop: 10}} wrap>
+                                  <Button size="small" onClick={() => applyNodeCAPathToForms(item.path)}>填入节点表单</Button>
+                                  <Button
+                                    size="small"
+                                    onClick={async () => {
+                                      try {
+                                        await copyTextToClipboard(String(item.path || ""));
+                                        message.success("路径已复制");
+                                      } catch (err) {
+                                        message.error(`复制失败: ${err.message}`);
+                                      }
+                                    }}
+                                  >
+                                    复制路径
+                                  </Button>
+                                  <Popconfirm title={`删除证书 ${item.name} ?`} onConfirm={() => deleteNodeCA(item)}>
+                                    <Button size="small" danger loading={!!nodeCADeleting[item.name]}>删除</Button>
+                                  </Popconfirm>
+                                </Space>
+                              </Card>
+                            ))}
+                            {(nodeCAItems || []).length === 0 ? (
+                              <Typography.Text type="secondary">暂无导入证书，可点击“导入 CA”。</Typography.Text>
+                            ) : null}
+                          </Space>
+                        ) : (
+                          <Table
+                            rowKey="name"
+                            loading={nodeCALoading}
+                            dataSource={nodeCAItems}
+                            pagination={false}
+                            locale={{emptyText: "暂无导入证书，可点击“导入 CA”。"}}
+                            columns={[
+                              {title: "名称", dataIndex: "name", width: 180},
+                              {
+                                title: "路径",
+                                dataIndex: "path",
+                                width: 330,
+                                render: (v) => (
+                                  <Typography.Text
+                                    copyable={v ? {text: String(v)} : false}
+                                    ellipsis={{tooltip: String(v || "-")}}
+                                    style={{display: "inline-block", maxWidth: "100%"}}
+                                  >
+                                    {String(v || "-")}
+                                  </Typography.Text>
+                                ),
+                              },
+                              {
+                                title: "指纹",
+                                dataIndex: "fingerprint",
+                                width: 190,
+                                render: (v) => (
+                                  <Tooltip title={String(v || "")}>
+                                    <Typography.Text>{String(v || "").slice(0, 16)}...</Typography.Text>
+                                  </Tooltip>
+                                ),
+                              },
+                              {
+                                title: "有效期",
+                                dataIndex: "not_after",
+                                width: 180,
+                                render: (_, row) => (
+                                  <Tag color={row?.is_expired ? "red" : "green"}>
+                                    {formatDateTimeCST(row?.not_after)}
+                                  </Tag>
+                                ),
+                              },
+                              {
+                                title: "引用节点",
+                                dataIndex: "used_by",
+                                render: (arr) => Array.isArray(arr) && arr.length > 0 ? (
+                                  <Space size={[4, 4]} wrap>
+                                    {arr.map((name) => <Tag key={`node-ca-used-${name}`}>{name}</Tag>)}
+                                  </Space>
+                                ) : "-",
+                              },
+                              {
+                                title: "操作",
+                                dataIndex: "name",
+                                width: 220,
+                                render: (_, row) => (
+                                  <Space wrap>
+                                    <Button size="small" onClick={() => applyNodeCAPathToForms(row.path)}>填入节点表单</Button>
+                                    <Popconfirm title={`删除证书 ${row.name} ?`} onConfirm={() => deleteNodeCA(row)}>
+                                      <Button size="small" danger loading={!!nodeCADeleting[row.name]}>删除</Button>
+                                    </Popconfirm>
+                                  </Space>
+                                ),
+                              },
+                            ]}
+                          />
+                        )}
+                      </Card>
                       <Space style={{marginBottom: 10}} wrap>
                         <Button size="small" onClick={selectAllVisibleNodes} disabled={nodes.length === 0}>全选所有节点</Button>
                         <Button size="small" onClick={clearVisibleSelectedNodes} disabled={visibleSelected.length === 0}>取消当前选择</Button>
@@ -5884,6 +6216,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                       <Space style={{marginBottom: 12}} wrap>
                         <Button loading={routeSelfHealLoading} onClick={loadRouteSelfHeal}>刷新状态</Button>
                         <Button loading={routeCheckLoading} disabled={tunTaskBusy} onClick={runRouteCheck}>路由自检</Button>
+                        <Button loading={routeOSProbeLoading} disabled={tunTaskBusy} onClick={loadRouteOSProbe}>系统路由快照</Button>
                         <Button onClick={exportRouteSelfHealJSON}>导出 JSON</Button>
                         <Button onClick={exportRouteSelfHealText}>导出文本</Button>
                         <Button loading={exportingSelfHealReport} onClick={exportFullSelfHealReportJSON}>导出完整报告(JSON)</Button>
@@ -5992,6 +6325,134 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                         </>
                       ) : (
                         <Typography.Text type="secondary">暂无路由自愈数据，点击“刷新状态”获取。</Typography.Text>
+                      )}
+                      <Divider orientation="left">系统路由快照（手动）</Divider>
+                      {routeOSProbeRaw ? (
+                        <Space direction="vertical" style={{display: "flex"}}>
+                          <Alert
+                            showIcon
+                            type={routeOSProbeRaw?.summary?.ok ? "success" : "warning"}
+                            message={routeOSProbeRaw?.summary?.ok ? "系统路由快照正常" : "系统路由快照发现风险"}
+                            description={`命令失败 ${toPositiveInt(routeOSProbeRaw?.summary?.command_failures)} 个 · split_on_tun=${routeOSProbeRaw?.summary?.split_route_on_tun ? "yes" : "no"}`}
+                          />
+                          {Array.isArray(routeOSProbeRaw?.summary?.notes) && routeOSProbeRaw.summary.notes.length > 0 ? (
+                            <Alert
+                              showIcon
+                              type="info"
+                              message="诊断提示"
+                              description={(
+                                <ul style={{marginBottom: 0, paddingLeft: 18}}>
+                                  {routeOSProbeRaw.summary.notes.map((item, idx) => (
+                                    <li key={`route-os-note-${idx}`}>{String(item || "").trim()}</li>
+                                  ))}
+                                </ul>
+                              )}
+                            />
+                          ) : null}
+                          <Descriptions size="small" bordered column={isMobile ? 1 : 2}>
+                            <Descriptions.Item label="时间">{formatDateTimeCST(routeOSProbeRaw.time)}</Descriptions.Item>
+                            <Descriptions.Item label="节点">{routeOSProbeRaw.current || "-"}</Descriptions.Item>
+                            <Descriptions.Item label="服务端">{routeOSProbeRaw.server || "-"}</Descriptions.Item>
+                            <Descriptions.Item label="服务端主机">{routeOSProbeRaw.server_host || "-"}</Descriptions.Item>
+                            <Descriptions.Item label="TUN">
+                              <Tag color={routeOSProbeRaw?.tun?.running ? "processing" : "default"}>
+                                {routeOSProbeRaw?.tun?.running ? "运行中" : "未运行"}
+                              </Tag>
+                              <Tag color={routeOSProbeRaw?.tun?.auto_route ? "blue" : "default"}>
+                                auto_route: {routeOSProbeRaw?.tun?.auto_route ? "on" : "off"}
+                              </Tag>
+                              {routeOSProbeRaw?.tun?.configured_name ? <Tag>{routeOSProbeRaw.tun.configured_name}</Tag> : null}
+                              {routeOSProbeRaw?.tun?.runtime_config_name ? <Tag>runtime_cfg: {routeOSProbeRaw.tun.runtime_config_name}</Tag> : null}
+                              <Tag color={routeOSProbeRaw?.tun?.runtime_auto_route ? "blue" : "default"}>
+                                runtime_auto_route: {routeOSProbeRaw?.tun?.runtime_auto_route ? "on" : "off"}
+                              </Tag>
+                              {routeOSProbeRaw?.tun?.runtime_device ? <Tag color="purple">runtime_dev: {routeOSProbeRaw.tun.runtime_device}</Tag> : null}
+                              {routeOSProbeRaw?.tun?.active_iface ? <Tag color="blue">active: {routeOSProbeRaw.tun.active_iface}</Tag> : null}
+                              <Tag color={routeOSProbeRaw?.tun?.route_manager_active ? "blue" : "red"}>
+                                route_mgr: {routeOSProbeRaw?.tun?.route_manager_active ? "on" : "off"}
+                              </Tag>
+                            </Descriptions.Item>
+                            <Descriptions.Item label="Live 命中(60s)">
+                              <Tag>total: {toPositiveInt(routeOSProbeRaw?.routing_live_hits_60s?.total)}</Tag>
+                              <Tag color="blue">node: {toPositiveInt(routeOSProbeRaw?.routing_live_hits_60s?.node)}</Tag>
+                              <Tag color="green">direct: {toPositiveInt(routeOSProbeRaw?.routing_live_hits_60s?.direct)}</Tag>
+                              <Tag color="red">reject: {toPositiveInt(routeOSProbeRaw?.routing_live_hits_60s?.reject)}</Tag>
+                            </Descriptions.Item>
+                          </Descriptions>
+                          <Space direction="vertical" style={{display: "flex"}}>
+                            {renderRouteOSProbeCommandCard("默认路由探测", routeOSProbeRaw?.probes?.route_default, "route-default")}
+                            {renderRouteOSProbeCommandCard("公网路由探测 (1.1.1.1)", routeOSProbeRaw?.probes?.route_public, "route-public")}
+                            {renderRouteOSProbeCommandCard("分片路由探测 (151.101.1.69)", routeOSProbeRaw?.probes?.route_split_probe, "route-split-probe")}
+                            {renderRouteOSProbeCommandCard("服务端路由探测", routeOSProbeRaw?.probes?.route_server, "route-server")}
+                            {renderRouteOSProbeCommandCard("系统路由表 (inet)", routeOSProbeRaw?.probes?.route_table_inet, "route-table-inet")}
+                            {renderRouteOSProbeCommandCard("活跃 TUN 网卡统计", routeOSProbeRaw?.probes?.netstat_active_utun, "netstat-active-utun")}
+                          </Space>
+                          {routeOSProbeRaw?.probes?.route_split_v4 ? (
+                            <Card size="small" title="分片路由状态 (0/1, 128/1)">
+                              <Space direction="vertical" style={{display: "flex"}}>
+                                {["route_0_1", "route_128_1"].map((key) => {
+                                  const row = routeOSProbeRaw?.probes?.route_split_v4?.[key] || {};
+                                  return (
+                                    <Space key={`split-v4-${key}`} wrap>
+                                      <Tag>{key}</Tag>
+                                      <Tag color={row?.present ? "blue" : "default"}>{row?.present ? "present" : "missing"}</Tag>
+                                      <Tag color={row?.on_tun ? "green" : "red"}>{row?.on_tun ? "on_tun" : "not_on_tun"}</Tag>
+                                      {row?.interface ? <Tag>iface: {row.interface}</Tag> : null}
+                                      {row?.gateway ? <Tag color="blue">gw: {row.gateway}</Tag> : null}
+                                      {row?.raw_line ? <Typography.Text code>{row.raw_line}</Typography.Text> : null}
+                                    </Space>
+                                  );
+                                })}
+                              </Space>
+                            </Card>
+                          ) : null}
+                          {routeOSProbeRaw?.probes?.ifconfig_utun_list ? (
+                            <Card size="small" title="utun 接口列表">
+                              <Space style={{marginBottom: 8}} wrap>
+                                <Tag color={routeOSProbeRaw?.probes?.ifconfig_utun_list?.ok ? "blue" : "red"}>
+                                  {routeOSProbeRaw?.probes?.ifconfig_utun_list?.ok ? "OK" : "FAIL"}
+                                </Tag>
+                                <Tag color={routeOSProbeRaw?.probes?.ifconfig_utun_list?.runtime_device_seen ? "blue" : "orange"}>
+                                  runtime_device_seen: {routeOSProbeRaw?.probes?.ifconfig_utun_list?.runtime_device_seen ? "yes" : "no"}
+                                </Tag>
+                                {String(routeOSProbeRaw?.probes?.ifconfig_utun_list?.command || "").trim() ? (
+                                  <Typography.Text code>{String(routeOSProbeRaw?.probes?.ifconfig_utun_list?.command || "").trim()}</Typography.Text>
+                                ) : null}
+                              </Space>
+                              {String(routeOSProbeRaw?.probes?.ifconfig_utun_list?.error || "").trim() ? (
+                                <Alert style={{marginBottom: 8}} type="error" showIcon message={String(routeOSProbeRaw?.probes?.ifconfig_utun_list?.error || "").trim()} />
+                              ) : null}
+                              <Space wrap>
+                                {(routeOSProbeRaw?.probes?.ifconfig_utun_list?.interfaces || []).map((name) => (
+                                  <Tag key={`utun-list-${name}`}>{name}</Tag>
+                                ))}
+                              </Space>
+                            </Card>
+                          ) : null}
+                          {Array.isArray(routeOSProbeRaw?.probes?.ifconfig_utun_detail) && routeOSProbeRaw.probes.ifconfig_utun_detail.length > 0 ? (
+                            <Card size="small" title="utun 接口详情">
+                              <Space direction="vertical" style={{display: "flex"}}>
+                                {routeOSProbeRaw.probes.ifconfig_utun_detail.map((row, idx) => (
+                                  <Card
+                                    key={`utun-detail-${row?.interface || "iface"}-${idx}`}
+                                    size="small"
+                                    title={row?.interface || "-"}
+                                    extra={<Tag color={row?.ok ? "blue" : "red"}>{row?.ok ? "OK" : "FAIL"}</Tag>}
+                                  >
+                                    {String(row?.error || "").trim() ? (
+                                      <Alert style={{marginBottom: 8}} type="error" showIcon message={String(row?.error || "").trim()} />
+                                    ) : null}
+                                    <Typography.Paragraph copyable style={{whiteSpace: "pre-wrap", marginBottom: 0}}>
+                                      {String(row?.output || "").trim() || "-"}
+                                    </Typography.Paragraph>
+                                  </Card>
+                                ))}
+                              </Space>
+                            </Card>
+                          ) : null}
+                        </Space>
+                      ) : (
+                        <Typography.Text type="secondary">暂无系统路由快照，点击“系统路由快照”执行。</Typography.Text>
                       )}
                     </>
                   )
@@ -6538,7 +6999,13 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
                     />
                   </Form.Item>
                   <Form.Item name="ca_cert_path" label="CA证书路径">
-                    <Input style={{width: 260}} placeholder="/path/to/ca.crt" />
+                    <AutoComplete
+                      style={{width: 300}}
+                      options={nodeCAPathOptions}
+                      filterOption={(input, option) => String(option?.label || option?.value || "").toLowerCase().includes(String(input || "").toLowerCase())}
+                    >
+                      <Input placeholder="/path/to/ca.crt" />
+                    </AutoComplete>
                   </Form.Item>
                   <Form.Item>
                     <Button type="primary" loading={savingNode} onClick={createNode}>新增</Button>
@@ -6909,7 +7376,14 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           <Form.Item label="证书校验策略" name="allow_insecure_mode">
             <Select options={nodeAllowInsecureModeOptionsList} />
           </Form.Item>
-          <Form.Item label="CA证书路径" name="ca_cert_path"><Input /></Form.Item>
+          <Form.Item label="CA证书路径" name="ca_cert_path">
+            <AutoComplete
+              options={nodeCAPathOptions}
+              filterOption={(input, option) => String(option?.label || option?.value || "").toLowerCase().includes(String(input || "").toLowerCase())}
+            >
+              <Input placeholder="/path/to/ca.crt" />
+            </AutoComplete>
+          </Form.Item>
         </Form>
       </Modal>
 

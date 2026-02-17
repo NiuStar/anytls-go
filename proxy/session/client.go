@@ -4,11 +4,13 @@ import (
 	"anytls/proxy/padding"
 	"anytls/util"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +21,9 @@ import (
 
 var clientDebugSessionPool = os.Getenv("CLIENT_DEBUG_SESSION_POOL") == "1"
 var clientStreamCounter atomic.Uint64
+
+const clientCreateStreamMaxAttempts = 3
+const clientCreateSessionMaxProbeInflight = 2
 
 type Client struct {
 	die       context.Context
@@ -44,7 +49,7 @@ type Client struct {
 	createFailureCount  int
 	createNextAllowedAt time.Time
 	createLastErr       error
-	createProbeInflight bool
+	createProbeInflight int
 }
 
 func NewClient(ctx context.Context, dialOut util.DialOutFunc,
@@ -81,56 +86,95 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	var stream *Stream
 	var err error
 
-	session = c.getIdleSession()
-	if session == nil {
-		session, err = c.createSessionWithBackoff(ctx)
-		if session != nil && clientDebugSessionPool {
-			logrus.Infoln("create session:", session.seq)
-		}
-	} else {
-		if clientDebugSessionPool {
-			logrus.Infoln("get session:", session.seq)
-		}
-	}
-	if session == nil {
-		return nil, fmt.Errorf("failed to create session: %w", err)
-	}
-	stream, err = session.OpenStream()
-	if err != nil {
-		session.Close()
-		return nil, fmt.Errorf("failed to create stream: %w", err)
-	}
-
-	if clientDebugSessionPool {
-		cn := clientStreamCounter.Add(1)
-		s := c.sessionCounter.Load()
-		logrus.Infoln("cumulative session:", s, "cumulative stream:", cn, "avg:", float64(cn)/float64(s))
-	}
-
-	stream.dieHook = func() {
-		// If Session is not closed, put this Stream to pool
-		if !session.IsClosed() {
-			if clientDebugSessionPool {
-				logrus.Infoln("put session:", session.seq, stream.id)
+	for attempt := 1; attempt <= clientCreateStreamMaxAttempts; attempt++ {
+		session = c.getIdleSession()
+		if session == nil {
+			session, err = c.createSessionWithBackoff(ctx)
+			if session != nil && clientDebugSessionPool {
+				logrus.Infoln("create session:", session.seq)
 			}
-			select {
-			case <-c.die.Done():
-				// Now client has been closed
-				go session.Close()
-			default:
-				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
-				c.idleSessionLock.Unlock()
+			if session == nil {
+				if err != nil && attempt < clientCreateStreamMaxAttempts && shouldRetryCreateStreamErr(err) {
+					logrus.Warnf("[Client] create session transient failure, retrying (%d/%d): %v", attempt, clientCreateStreamMaxAttempts, err)
+					continue
+				}
+				return nil, fmt.Errorf("failed to create session: %w", err)
 			}
 		} else {
 			if clientDebugSessionPool {
-				logrus.Infoln("discard session stream:", session.seq, stream.id)
+				logrus.Infoln("get session:", session.seq)
 			}
 		}
-	}
 
-	return stream, nil
+		stream, err = session.OpenStream()
+		if err != nil {
+			session.Close()
+			if attempt < clientCreateStreamMaxAttempts && shouldRetryCreateStreamErr(err) {
+				logrus.Warnf("[Client] open stream transient failure, retrying (%d/%d): %v", attempt, clientCreateStreamMaxAttempts, err)
+				continue
+			}
+			return nil, fmt.Errorf("failed to create stream: %w", err)
+		}
+
+		if clientDebugSessionPool {
+			cn := clientStreamCounter.Add(1)
+			s := c.sessionCounter.Load()
+			logrus.Infoln("cumulative session:", s, "cumulative stream:", cn, "avg:", float64(cn)/float64(s))
+		}
+
+		stream.dieHook = func() {
+			// If Session is not closed, put this Stream to pool
+			if !session.IsClosed() {
+				if clientDebugSessionPool {
+					logrus.Infoln("put session:", session.seq, stream.id)
+				}
+				select {
+				case <-c.die.Done():
+					// Now client has been closed
+					go session.Close()
+				default:
+					c.idleSessionLock.Lock()
+					session.idleSince = time.Now()
+					c.idleSession.Insert(math.MaxUint64-session.seq, session)
+					c.idleSessionLock.Unlock()
+				}
+			} else {
+				if clientDebugSessionPool {
+					logrus.Infoln("discard session stream:", session.seq, stream.id)
+				}
+			}
+		}
+
+		return stream, nil
+	}
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	return nil, fmt.Errorf("failed to create session: %w", err)
+}
+
+func (c *Client) Warmup(ctx context.Context, count int) int {
+	if c == nil || count <= 0 {
+		return 0
+	}
+	warmed := 0
+	for i := 0; i < count; i++ {
+		select {
+		case <-c.die.Done():
+			return warmed
+		default:
+		}
+		session, err := c.createSessionWithBackoff(ctx)
+		if err != nil || session == nil {
+			continue
+		}
+		c.idleSessionLock.Lock()
+		session.idleSince = time.Now()
+		c.idleSession.Insert(math.MaxUint64-session.seq, session)
+		c.idleSessionLock.Unlock()
+		warmed++
+	}
+	return warmed
 }
 
 func (c *Client) createSessionWithBackoff(ctx context.Context) (*Session, error) {
@@ -174,13 +218,15 @@ func (c *Client) beginCreateAttempt() (releaseProbe func(), wait time.Duration, 
 	if now.Before(c.createNextAllowedAt) {
 		return nil, c.createNextAllowedAt.Sub(now), lastErr
 	}
-	if c.createProbeInflight {
-		return nil, 250 * time.Millisecond, lastErr
+	if c.createProbeInflight >= clientCreateSessionMaxProbeInflight {
+		return nil, 120 * time.Millisecond, lastErr
 	}
-	c.createProbeInflight = true
+	c.createProbeInflight++
 	return func() {
 		c.createFailureLock.Lock()
-		c.createProbeInflight = false
+		if c.createProbeInflight > 0 {
+			c.createProbeInflight--
+		}
 		c.createFailureLock.Unlock()
 	}, 0, lastErr
 }
@@ -195,6 +241,10 @@ func (c *Client) finishCreateAttempt(err error) {
 		c.createLastErr = nil
 		return
 	}
+	// Caller-side cancellations should not poison shared upstream health window.
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 
 	c.createFailureCount++
 	c.createLastErr = err
@@ -206,17 +256,40 @@ func backoffDuration(failureCount int) time.Duration {
 	if failureCount <= 0 {
 		return 0
 	}
-	backoff := 300 * time.Millisecond
+	backoff := 150 * time.Millisecond
 	for i := 1; i < failureCount; i++ {
 		backoff *= 2
-		if backoff >= 8*time.Second {
-			return 8 * time.Second
+		if backoff >= 2*time.Second {
+			return 2 * time.Second
 		}
 	}
-	if backoff > 8*time.Second {
-		return 8 * time.Second
+	if backoff > 2*time.Second {
+		return 2 * time.Second
 	}
 	return backoff
+}
+
+func shouldRetryCreateStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "connection reset by peer") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "unexpected eof") ||
+		strings.Contains(text, "eof") ||
+		strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "i/o timeout")
 }
 
 func (c *Client) getIdleSession() (idle *Session) {

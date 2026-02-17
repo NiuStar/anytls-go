@@ -59,6 +59,13 @@ func (c *myClient) Close() error {
 	return firstErr
 }
 
+func (c *myClient) Warmup(ctx context.Context, count int) int {
+	if c == nil || c.sessionClient == nil || count <= 0 {
+		return 0
+	}
+	return c.sessionClient.Warmup(ctx, count)
+}
+
 func (c *myClient) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	if c.createProxyFn != nil {
 		return c.createProxyFn(ctx, destination)
