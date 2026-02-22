@@ -1845,7 +1845,6 @@ function App() {
           web_username: data.config.web_username || "",
           web_password: data.config.web_password || "",
           min_idle_session: data.config.min_idle_session,
-          default_node: data.config.default_node,
           tun_enabled: !!data.config.tun?.enabled,
           tun_name: data.config.tun?.name || "anytls0",
           tun_mtu: data.config.tun?.mtu || 1500,
@@ -1917,6 +1916,9 @@ function App() {
     try {
       const data = await api("/api/v1/status");
       setRuntimeStatus(data || null);
+      if (String(data?.current || "").trim()) {
+        setCurrent(String(data.current).trim());
+      }
     } catch (err) {
       setRuntimeStatus(null);
     } finally {
@@ -2136,13 +2138,18 @@ function App() {
     const values = await configForm.validateFields();
     setSavingConfig(true);
     try {
+      const keepDefaultNode = String(config?.default_node || current || (Array.isArray(nodes) && nodes[0]?.name) || "").trim();
+      if (!keepDefaultNode) {
+        message.error("当前配置缺少可用节点标识，请先保证至少存在一个节点并刷新配置");
+        return;
+      }
       const payload = {
         listen: values.listen,
         control: values.control,
         web_username: values.web_username || "",
         web_password: values.web_password || "",
         min_idle_session: values.min_idle_session,
-        default_node: values.default_node,
+        default_node: keepDefaultNode,
         tun: {
           enabled: !!values.tun_enabled,
           name: values.tun_name,
@@ -2402,16 +2409,24 @@ function App() {
     }
   }
 
-  async function forceReconnectCurrentNode() {
-    const nodeName = String(runtimeStatus?.current || current || "").trim();
+  async function forceReconnectCurrentNode(preferredNode = "") {
+    const nodeName = String(preferredNode || runtimeStatus?.current || current || "").trim();
     if (!nodeName) {
       return false;
     }
     try {
-      await api("/api/v1/switch", {
+      const res = await api("/api/v1/switch", {
         method: "POST",
         body: JSON.stringify({name: nodeName}),
       });
+      const warning = String(res?.switch_warning || "").trim();
+      const switchedTo = String(res?.current || nodeName || "").trim();
+      if (switchedTo) {
+        setCurrent(switchedTo);
+      }
+      if (warning) {
+        message.warning(`切换后路由刷新异常，已保留所选节点: ${warning}`);
+      }
       return true;
     } catch (err) {
       message.warning(`强制重连失败: ${err.message}`);
@@ -2451,8 +2466,8 @@ function App() {
       message.warning(`首次出口验证未命中：${firstProbeNode || "-"}${probeErr ? ` · ${probeErr}` : ""}`);
     }
 
-    message.info("检测到切换未完全生效，正在自动重连并复检…");
-    const reconnectOK = await forceReconnectCurrentNode();
+    message.info("检测到切换未完全生效，正在直切目标节点并复检…");
+    const reconnectOK = await forceReconnectCurrentNode(target);
     if (!reconnectOK) {
       return;
     }
@@ -3180,11 +3195,16 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
 
   async function switchNode(name) {
     try {
-      await api("/api/v1/switch", {
+      const res = await api("/api/v1/switch", {
         method: "POST",
         body: JSON.stringify({name})
       });
-      message.success(`已切换到 ${name}`);
+      const switchedTo = String(res?.current || name || "").trim() || String(name || "").trim();
+      message.success(`已切换到 ${switchedTo}`);
+      const warning = String(res?.switch_warning || "").trim();
+      if (warning) {
+        message.warning(`切换后路由刷新异常，已保留所选节点: ${warning}`);
+      }
       await refreshAll();
     } catch (err) {
       message.error(`切换失败: ${err.message}`);
@@ -5200,7 +5220,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
 
           <Card className="card" title="运行状态" extra={<Button size="small" onClick={refreshStatus} loading={statusLoading}>刷新状态</Button>}>
             <Space wrap>
-              <Tag color="blue">默认节点: {runtimeStatus?.current || "-"}</Tag>
+              <Tag color="blue">当前节点: {runtimeStatus?.current || "-"}</Tag>
               <Tag color={runtimeStatus?.tun?.running ? "processing" : "default"}>TUN: {runtimeStatus?.tun?.running ? "运行中" : "未运行"}</Tag>
               {(runtimeStatus?.tun?.enabled && !runtimeStatus?.tun?.running && runtimeStatus?.tun?.auto_recover_running) ? (
                 <Tag color="gold">TUN自动恢复: 监测中</Tag>
@@ -6812,17 +6832,8 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
             <Form.Item label="最小空闲会话" name="min_idle_session" rules={[{required: true}]}>
               <InputNumber style={{width: 140}} min={1} />
             </Form.Item>
-            <Form.Item label="默认节点" name="default_node" rules={[{required: true, message: "请选择默认节点"}]}>
-              <Select
-                style={{width: 220}}
-                placeholder={nodes.length ? "请选择默认节点" : "暂无可用节点"}
-                options={(nodes || []).map((n) => ({value: n.name, label: n.name}))}
-                showSearch
-                optionFilterProp="label"
-                disabled={!nodes.length}
-              />
-            </Form.Item>
           </Space>
+          <Typography.Text type="secondary">默认出口由“规则分流”中的“默认兜底动作”统一控制。</Typography.Text>
 
           <Divider orientation="left">TUN</Divider>
           <Space style={{display: "flex"}} align="start" wrap>

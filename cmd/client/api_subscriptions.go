@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/util"
 	"bytes"
 	"context"
 	"crypto/x509"
@@ -747,7 +748,7 @@ func fetchSubscriptionNodes(ctx context.Context, rawURL string) ([]subscriptionN
 		if err != nil {
 			return nil, "", "", nil, err
 		}
-		req.Header.Set("User-Agent", "anytls-client-subscription/1.0")
+		req.Header.Set("User-Agent", util.WireUserAgent())
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err

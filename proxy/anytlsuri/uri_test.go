@@ -64,3 +64,16 @@ func TestBuildWithTLSOptions(t *testing.T) {
 		t.Fatalf("ca_cert_path mismatch: %q", node.CACertPath)
 	}
 }
+
+func TestParseKeepsPasswordWithRawColon(t *testing.T) {
+	node, err := Parse("anytls://abc:def@example.com:443?sni=test.example")
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if node.Password != "abc:def" {
+		t.Fatalf("password mismatch: %q", node.Password)
+	}
+	if node.Server != "example.com:443" {
+		t.Fatalf("server mismatch: %q", node.Server)
+	}
+}

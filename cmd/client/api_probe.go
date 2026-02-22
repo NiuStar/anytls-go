@@ -795,7 +795,13 @@ func shouldRetryLatencyProbeError(errText string) bool {
 	return strings.Contains(errText, "connection reset by peer") ||
 		strings.Contains(errText, "unexpected eof") ||
 		strings.Contains(errText, "eof") ||
-		strings.Contains(errText, "broken pipe")
+		strings.Contains(errText, "broken pipe") ||
+		strings.Contains(errText, "context deadline exceeded") ||
+		strings.Contains(errText, "i/o timeout") ||
+		strings.Contains(errText, "timed out") ||
+		strings.Contains(errText, "timeout") ||
+		strings.Contains(errText, "temporary failure") ||
+		strings.Contains(errText, "temporarily unavailable")
 }
 
 func shouldRetryBandwidthProbeError(errText string) bool {

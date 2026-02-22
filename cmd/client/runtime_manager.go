@@ -103,6 +103,32 @@ func (m *runtimeClientManager) Switch(name string) error {
 	return nil
 }
 
+func (m *runtimeClientManager) ForceSwitch(name string) error {
+	if _, ok := m.Node(name); !ok {
+		return fmt.Errorf("node not found: %s", name)
+	}
+
+	var oldClient *myClient
+	m.lock.Lock()
+	prev := m.currentName
+	if prev != "" && prev != name {
+		oldClient = m.clients[prev]
+		// Keep behavior aligned with normal switch: old node client is removed
+		// so future traffic will not stick to stale previous routes.
+		delete(m.clients, prev)
+	}
+	m.currentName = name
+	m.lock.Unlock()
+	if prev != name {
+		logrus.Warnf("[Client] switch node forced (degraded mode): %s => %s", prev, name)
+		m.warmupCurrentNodeClientAsync(name, m.switchWarmupCount())
+		if oldClient != nil {
+			m.closeNodeClientAsync(prev, name, oldClient)
+		}
+	}
+	return nil
+}
+
 func (m *runtimeClientManager) switchWarmupCount() int {
 	if m == nil {
 		return 1

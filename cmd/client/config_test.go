@@ -124,6 +124,20 @@ func TestNormalizeNodePasswordPreserveURIWhitespace(t *testing.T) {
 	}
 }
 
+func TestNormalizeNodePasswordAutoRepairLegacySplitByColon(t *testing.T) {
+	node := clientNodeConfig{
+		Name:     "legacy-colon",
+		URI:      "anytls://abc:def@23.141.52.18:20086/",
+		Password: "abc",
+	}
+	if err := normalizeNode(&node); err != nil {
+		t.Fatalf("normalize failed: %v", err)
+	}
+	if node.Password != "abc:def" {
+		t.Fatalf("expected repaired password, got %q", node.Password)
+	}
+}
+
 func TestNormalizeNodeGroups(t *testing.T) {
 	node := clientNodeConfig{
 		Name:     "n1",

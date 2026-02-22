@@ -34,8 +34,21 @@ func Parse(raw string) (Node, error) {
 		Server: strings.TrimSpace(u.Host),
 	}
 	if u.User != nil {
-		// URL userinfo is percent-encoded on wire; Username returns decoded text.
-		out.Password = u.User.Username()
+		// URL userinfo is percent-encoded on wire; Username/Password return decoded text.
+		// For anytls URI, the whole userinfo is treated as one credential.
+		// Some third-party subscriptions may emit unescaped ":" inside userinfo
+		// (for example anytls://token:part2@host), which net/url parses as
+		// Username + Password. Re-join them to preserve compatibility.
+		user := u.User.Username()
+		if pass, hasPass := u.User.Password(); hasPass {
+			if user == "" {
+				out.Password = pass
+			} else {
+				out.Password = user + ":" + pass
+			}
+		} else {
+			out.Password = user
+		}
 	}
 	q := u.Query()
 	out.SNI = strings.TrimSpace(q.Get("sni"))

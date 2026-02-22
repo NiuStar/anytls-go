@@ -179,7 +179,7 @@ func runServer(args []string) {
 					"[Server] inbound connection dropped (pressure)",
 					fmt.Errorf("active=%d soft_limit=%d hard_limit=%d %s", activeNow, softLimit, connLimit, pressureReason),
 				)
-				_ = c.Close()
+				fallback(ctx, c)
 				continue
 			}
 		}
@@ -209,7 +209,7 @@ func runServer(args []string) {
 		if !acquired {
 			pressureCtl.onPressureDrop()
 			dropWarnLogger.log("[Server] inbound connection dropped", fmt.Errorf("active=%d limit=%d %s", len(connSlots), connLimit, serverFDUsageSummary()))
-			_ = c.Close()
+			fallback(ctx, c)
 			continue
 		}
 		go func(conn net.Conn) {

@@ -122,7 +122,7 @@ func (s *Session) Run() {
 
 	settings := util.StringMap{
 		"v":           "2",
-		"client":      util.ProgramVersionName,
+		"client":      util.WireClientTag(),
 		"padding-md5": s.padding.Load().Md5,
 	}
 	for k, v := range s.clientSettings {

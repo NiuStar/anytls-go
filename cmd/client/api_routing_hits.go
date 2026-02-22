@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/util"
 	std_bufio "bufio"
 	"context"
 	"crypto/tls"
@@ -474,7 +475,7 @@ func runRoutingEgressHTTPSProbe(ctx context.Context, conn net.Conn, host, path s
 		}
 	}
 
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: anytls-egress-probe/1.0\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, host)
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n", path, host, util.WireUserAgent())
 	if _, err := io.WriteString(tlsConn, req); err != nil {
 		return 0, certSubject, certDNSNames, err
 	}

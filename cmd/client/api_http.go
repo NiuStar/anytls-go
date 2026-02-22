@@ -2,6 +2,7 @@ package main
 
 import (
 	"anytls/proxy/nodeopts"
+	"anytls/util"
 	"bufio"
 	"bytes"
 	"context"
@@ -695,6 +696,7 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 		triggerRoutingReconnect := false
 		triggerNodeSwitchReconnect := false
 		routingGroupSynced := ""
+		defaultNodeSwitchWarning := ""
 		var queuedTun *clientTunConfig
 		if req.Listen != nil {
 			next := strings.TrimSpace(*req.Listen)
@@ -802,15 +804,23 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 			prev := s.manager.CurrentNodeName()
 			if prev != target {
 				if err := s.manager.Switch(target); err != nil {
-					writeError(w, http.StatusBadRequest, err.Error())
-					return
+					if forceErr := s.manager.ForceSwitch(target); forceErr != nil {
+						writeError(w, http.StatusBadRequest, err.Error())
+						return
+					}
+					defaultNodeSwitchWarning = strings.TrimSpace(fmt.Sprintf("manager switch degraded: %v", err))
+					logrus.Warnf("[Client] config default node switch degraded, keep target node: from=%s to=%s err=%v", prev, target, err)
 				}
 				if s.tun != nil {
 					node, _ := findNodeByName(s.cfg.Nodes, target)
 					if err := s.tun.OnSwitch(node); err != nil {
-						_ = s.manager.Switch(prev)
-						writeError(w, http.StatusBadRequest, err.Error())
-						return
+						msg := strings.TrimSpace(fmt.Sprintf("tun switch degraded: %v", err))
+						if defaultNodeSwitchWarning == "" {
+							defaultNodeSwitchWarning = msg
+						} else {
+							defaultNodeSwitchWarning = defaultNodeSwitchWarning + "; " + msg
+						}
+						logrus.Warnf("[Client] config default node tun switch degraded, keep target node: from=%s to=%s err=%v", prev, target, err)
 					}
 					s.resetDNSProbeStateLocked("config-default-node")
 					s.applyBypassRoutesLocked("config-default-node")
@@ -862,6 +872,9 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if routingGroupSynced != "" {
 			resp["routing_group_synced"] = routingGroupSynced
+		}
+		if defaultNodeSwitchWarning != "" {
+			resp["default_node_switch_warning"] = defaultNodeSwitchWarning
 		}
 		if tunTaskID != "" {
 			resp["tun_task_id"] = tunTaskID
@@ -2954,7 +2967,7 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 	}
 	buildProbeClient := func() (*myClient, error) {
 		// Use a non-cancelled parent context for probe client lifecycle.
-		// The client is closed explicitly after each attempt.
+		// The client is closed explicitly after each target probe.
 		return buildClientFromNode(context.Background(), node, minIdle)
 	}
 
@@ -3031,6 +3044,27 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 			attempts := make([]map[string]any, 0, maxAttempts)
 			var finalErr error
 			mismatch := false
+			client, clientErr := buildProbeClient()
+			if clientErr != nil {
+				wrapped := fmt.Errorf("%s (%s): build probe client failed: %w", node.Name, node.Server, clientErr)
+				item["error"] = wrapped.Error()
+				item["error_kind"] = classifyHTTPSProbeErrorKind(wrapped)
+				failCount++
+				if firstErr == nil {
+					firstErr = wrapped
+				}
+				return
+			}
+			defer func() { _ = client.Close() }()
+			rebuildProbeClient := func() error {
+				_ = client.Close()
+				next, err := buildProbeClient()
+				if err != nil {
+					return err
+				}
+				client = next
+				return nil
+			}
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				attemptStart := time.Now()
 				attemptItem := map[string]any{
@@ -3038,33 +3072,27 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 					"ok":      false,
 				}
 
-				client, clientErr := buildProbeClient()
-				if clientErr != nil {
-					wrapped := fmt.Errorf("%s (%s): build probe client failed: %w", node.Name, node.Server, clientErr)
-					attemptItem["stage"] = "build_client"
-					attemptItem["error"] = wrapped.Error()
-					attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
-					attempts = append(attempts, attemptItem)
-					finalErr = wrapped
-					if attempt < maxAttempts && shouldRetryHTTPSProbeError(clientErr) {
-						time.Sleep(120 * time.Millisecond)
-						continue
-					}
-					break
-				}
-
 				ctx, cancel := context.WithTimeout(context.Background(), probeTimeout+2*time.Second)
 				conn, dialErr := client.CreateProxy(ctx, destination)
 				cancel()
 				if dialErr != nil {
-					_ = client.Close()
 					attemptItem["stage"] = "dial"
 					attemptItem["error"] = dialErr.Error()
+					attemptItem["error_kind"] = classifyHTTPSProbeErrorKind(dialErr)
 					attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
 					attempts = append(attempts, attemptItem)
 					finalErr = dialErr
 					if attempt < maxAttempts && shouldRetryHTTPSProbeError(dialErr) {
-						time.Sleep(120 * time.Millisecond)
+						if shouldRebuildHTTPSProbeClient(dialErr) {
+							if rebuildErr := rebuildProbeClient(); rebuildErr != nil {
+								wrapped := fmt.Errorf("%s (%s): rebuild probe client failed: %w", node.Name, node.Server, rebuildErr)
+								attemptItem["rebuild_error"] = wrapped.Error()
+								finalErr = wrapped
+								break
+							}
+							attemptItem["rebuild_client"] = true
+						}
+						time.Sleep(httpsProbeRetryBackoff(attempt))
 						continue
 					}
 					break
@@ -3078,10 +3106,10 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 				})
 				handshakeErr := tlsConn.Handshake()
 				if handshakeErr != nil {
-					_ = conn.Close()
-					_ = client.Close()
+					_ = tlsConn.Close()
 					attemptItem["stage"] = "tls_handshake"
 					attemptItem["error"] = handshakeErr.Error()
+					attemptItem["error_kind"] = classifyHTTPSProbeErrorKind(handshakeErr)
 					attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
 					attempts = append(attempts, attemptItem)
 					finalErr = handshakeErr
@@ -3090,7 +3118,16 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 						break
 					}
 					if attempt < maxAttempts && shouldRetryHTTPSProbeError(handshakeErr) {
-						time.Sleep(120 * time.Millisecond)
+						if shouldRebuildHTTPSProbeClient(handshakeErr) {
+							if rebuildErr := rebuildProbeClient(); rebuildErr != nil {
+								wrapped := fmt.Errorf("%s (%s): rebuild probe client failed: %w", node.Name, node.Server, rebuildErr)
+								attemptItem["rebuild_error"] = wrapped.Error()
+								finalErr = wrapped
+								break
+							}
+							attemptItem["rebuild_client"] = true
+						}
+						time.Sleep(httpsProbeRetryBackoff(attempt))
 						continue
 					}
 					break
@@ -3109,16 +3146,25 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 					}
 				}
 
-				if _, writeErr := io.WriteString(tlsConn, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: anytls-tun-check/1.0\r\nConnection: close\r\n\r\n", reqPath, host)); writeErr != nil {
-					_ = conn.Close()
-					_ = client.Close()
+				if _, writeErr := io.WriteString(tlsConn, fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nConnection: close\r\n\r\n", reqPath, host, util.WireUserAgent())); writeErr != nil {
+					_ = tlsConn.Close()
 					attemptItem["stage"] = "http_write"
 					attemptItem["error"] = writeErr.Error()
+					attemptItem["error_kind"] = classifyHTTPSProbeErrorKind(writeErr)
 					attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
 					attempts = append(attempts, attemptItem)
 					finalErr = writeErr
 					if attempt < maxAttempts && shouldRetryHTTPSProbeError(writeErr) {
-						time.Sleep(120 * time.Millisecond)
+						if shouldRebuildHTTPSProbeClient(writeErr) {
+							if rebuildErr := rebuildProbeClient(); rebuildErr != nil {
+								wrapped := fmt.Errorf("%s (%s): rebuild probe client failed: %w", node.Name, node.Server, rebuildErr)
+								attemptItem["rebuild_error"] = wrapped.Error()
+								finalErr = wrapped
+								break
+							}
+							attemptItem["rebuild_client"] = true
+						}
+						time.Sleep(httpsProbeRetryBackoff(attempt))
 						continue
 					}
 					break
@@ -3127,15 +3173,24 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 				reader := bufio.NewReader(tlsConn)
 				statusLine, readErr := reader.ReadString('\n')
 				if readErr != nil {
-					_ = conn.Close()
-					_ = client.Close()
+					_ = tlsConn.Close()
 					attemptItem["stage"] = "http_read_status"
 					attemptItem["error"] = readErr.Error()
+					attemptItem["error_kind"] = classifyHTTPSProbeErrorKind(readErr)
 					attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
 					attempts = append(attempts, attemptItem)
 					finalErr = readErr
 					if attempt < maxAttempts && shouldRetryHTTPSProbeError(readErr) {
-						time.Sleep(120 * time.Millisecond)
+						if shouldRebuildHTTPSProbeClient(readErr) {
+							if rebuildErr := rebuildProbeClient(); rebuildErr != nil {
+								wrapped := fmt.Errorf("%s (%s): rebuild probe client failed: %w", node.Name, node.Server, rebuildErr)
+								attemptItem["rebuild_error"] = wrapped.Error()
+								finalErr = wrapped
+								break
+							}
+							attemptItem["rebuild_client"] = true
+						}
+						time.Sleep(httpsProbeRetryBackoff(attempt))
 						continue
 					}
 					break
@@ -3148,8 +3203,7 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 						attemptItem["status_code"] = statusCode
 					}
 				}
-				_ = conn.Close()
-				_ = client.Close()
+				_ = tlsConn.Close()
 				attemptItem["stage"] = "done"
 				attemptItem["ok"] = true
 				attemptItem["duration_ms"] = time.Since(attemptStart).Milliseconds()
@@ -3173,6 +3227,7 @@ func (s *apiState) runTunHTTPSProbeViaNode(nodeName string, targets []string, ti
 			}
 			if finalErr != nil {
 				item["error"] = finalErr.Error()
+				item["error_kind"] = classifyHTTPSProbeErrorKind(finalErr)
 				if firstErr == nil {
 					firstErr = finalErr
 				}
@@ -3329,7 +3384,7 @@ func (s *apiState) runTunHTTPSProbe(targets []string, timeout time.Duration) (ma
 					}
 					return
 				}
-				req.Header.Set("User-Agent", "anytls-tun-check/1.0")
+				req.Header.Set("User-Agent", util.WireUserAgent())
 				resp, err = client.Do(req)
 				if err == nil {
 					break
@@ -3979,6 +4034,73 @@ func shouldRetryHTTPSProbeError(err error) bool {
 		strings.Contains(text, "temporarily unavailable")
 }
 
+func shouldRebuildHTTPSProbeClient(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" {
+		return false
+	}
+	return strings.Contains(text, "use of closed network connection") ||
+		strings.Contains(text, "unexpected eof") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, io.ErrClosedPipe.Error()) ||
+		strings.Contains(text, net.ErrClosed.Error())
+}
+
+func httpsProbeRetryBackoff(attempt int) time.Duration {
+	if attempt <= 1 {
+		return 120 * time.Millisecond
+	}
+	if attempt == 2 {
+		return 260 * time.Millisecond
+	}
+	return 420 * time.Millisecond
+}
+
+func classifyHTTPSProbeErrorKind(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" {
+		return "probe_error"
+	}
+	if isHostnameMismatchErrorText(text) {
+		return "hostname_mismatch"
+	}
+	if strings.Contains(text, "connection reset") {
+		return "upstream_reset"
+	}
+	if strings.Contains(text, "context deadline exceeded") ||
+		strings.Contains(text, "i/o timeout") ||
+		strings.Contains(text, "timed out") ||
+		strings.Contains(text, "timeout") {
+		return "upstream_timeout"
+	}
+	if strings.Contains(text, "no route to host") ||
+		strings.Contains(text, "network is unreachable") ||
+		strings.Contains(text, "network unreachable") {
+		return "upstream_unreachable"
+	}
+	if strings.Contains(text, "lookup ") ||
+		strings.Contains(text, "no such host") ||
+		strings.Contains(text, "could not resolve host") {
+		return "dns_error"
+	}
+	if strings.Contains(text, "tls") && strings.Contains(text, "handshake") {
+		return "tls_handshake"
+	}
+	if strings.Contains(text, "unexpected eof") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "eof") {
+		return "stream_io"
+	}
+	return "probe_error"
+}
+
 func shouldTryResolvedHTTPSFallback(err error) bool {
 	if err == nil {
 		return false
@@ -4064,7 +4186,7 @@ func runHTTPSProbeViaResolvedIPs(targetURL, host string, ips []string, timeout t
 			transport.CloseIdleConnections()
 			return result, reqErr
 		}
-		req.Header.Set("User-Agent", "anytls-tun-check/1.0")
+		req.Header.Set("User-Agent", util.WireUserAgent())
 
 		resp, doErr := client.Do(req)
 		if doErr != nil {
@@ -4467,7 +4589,7 @@ func resolveViaSingleDoHUpstream(ctx context.Context, upstream probeDoHUpstream,
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	req.Header.Set("User-Agent", "anytls-dns-probe/1.0")
+	req.Header.Set("User-Agent", util.WireUserAgent())
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -5727,9 +5849,25 @@ func (s *apiState) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prev := s.manager.CurrentNodeName()
+	switchWarning := ""
+	appendSwitchWarning := func(msg string) {
+		msg = strings.TrimSpace(msg)
+		if msg == "" {
+			return
+		}
+		if switchWarning == "" {
+			switchWarning = msg
+			return
+		}
+		switchWarning = switchWarning + "; " + msg
+	}
 	if err := s.manager.Switch(req.Name); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		if forceErr := s.manager.ForceSwitch(req.Name); forceErr != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		appendSwitchWarning(fmt.Sprintf("manager switch degraded: %v", err))
+		logrus.Warnf("[Client] manual switch degraded, keep target node: from=%s to=%s err=%v", prev, req.Name, err)
 	}
 	syncedGroup, syncedGroupChanged := s.syncDefaultRoutingGroupEgressLocked(req.Name, "manual-switch")
 	if s.tun != nil {
@@ -5739,9 +5877,8 @@ func (s *apiState) handleSwitch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.tun.OnSwitch(node); err != nil {
-			_ = s.manager.Switch(prev)
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
+			appendSwitchWarning(fmt.Sprintf("tun switch degraded: %v", err))
+			logrus.Warnf("[Client] manual switch keep-selected-on-tun-error: from=%s to=%s err=%v", prev, req.Name, err)
 		}
 		s.resetDNSProbeStateLocked("manual-switch")
 		s.applyBypassRoutesLocked("manual-switch")
@@ -5758,6 +5895,9 @@ func (s *apiState) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"current": req.Name,
 		"default": s.cfg.DefaultNode,
+	}
+	if switchWarning != "" {
+		resp["switch_warning"] = switchWarning
 	}
 	if syncedGroupChanged {
 		resp["routing_group_synced"] = syncedGroup

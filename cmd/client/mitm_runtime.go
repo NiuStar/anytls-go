@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/util"
 	"bufio"
 	"bytes"
 	"context"
@@ -1305,8 +1306,8 @@ func generateMITMCA() (*mitmCA, []byte, []byte, error) {
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
-			CommonName:   "AnyTLS MITM Root CA",
-			Organization: []string{"AnyTLS"},
+			CommonName:   util.WireMITMCACN(),
+			Organization: []string{util.WireMITMCAOrg()},
 		},
 		NotBefore:             now.Add(-time.Hour),
 		NotAfter:              now.AddDate(10, 0, 0),

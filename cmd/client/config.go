@@ -690,6 +690,10 @@ func normalizeNode(node *clientNodeConfig) error {
 				// Compatibility: older versions could persist URI-escaped password (for example %40).
 				// If it decodes to the same value as URI password, normalize to decoded form.
 				node.Password = decoded
+			} else if recovered, ok := recoverLegacyAnyTLSSplitPassword(node.Password, password); ok {
+				// Compatibility: older parser could truncate password at first ":" in URI userinfo.
+				// Auto-repair when stored password equals the truncated legacy prefix.
+				node.Password = recovered
 			}
 			if node.SNI == "" {
 				node.SNI = sni
@@ -838,6 +842,20 @@ func stableSubscriptionID(seed string) string {
 func parseAnyTLSURI(raw string) (server, password, sni, egressIP, egressRule string, err error) {
 	server, password, sni, egressIP, egressRule, _, _, err = parseAnyTLSURIWithOptions(raw)
 	return
+}
+
+func recoverLegacyAnyTLSSplitPassword(current, fromURI string) (string, bool) {
+	if current == "" || fromURI == "" || current == fromURI {
+		return "", false
+	}
+	idx := strings.Index(fromURI, ":")
+	if idx <= 0 {
+		return "", false
+	}
+	if current != fromURI[:idx] {
+		return "", false
+	}
+	return fromURI, true
 }
 
 func parseAnyTLSURIWithOptions(raw string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string, err error) {

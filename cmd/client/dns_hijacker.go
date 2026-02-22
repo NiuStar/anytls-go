@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/util"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -732,7 +733,7 @@ func (h *dnsHijacker) exchangeSingleDoH(ctx context.Context, upstream dnsDoHUpst
 	}
 	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
-	req.Header.Set("User-Agent", "anytls-dns-hijack/1.0")
+	req.Header.Set("User-Agent", util.WireUserAgent())
 
 	resp, err := client.Do(req)
 	if err != nil {

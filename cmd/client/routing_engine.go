@@ -1,6 +1,7 @@
 package main
 
 import (
+	"anytls/util"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -599,7 +600,7 @@ func loadProviderRaw(ctx context.Context, provider clientRuleProvider, configDir
 					req.Header.Add(key, value)
 				}
 			}
-			req.Header.Set("User-Agent", "anytls-client-routing/1.0")
+			req.Header.Set("User-Agent", util.WireUserAgent())
 			resp, err := client.Do(req)
 			if err != nil {
 				lastErr = err

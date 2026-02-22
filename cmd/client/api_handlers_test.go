@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -51,6 +52,15 @@ func doJSONRequest(t *testing.T, method, path string, payload any, handler func(
 	handler(resp, req)
 	return resp
 }
+
+type testTunRouteManager struct {
+	updateErr error
+}
+
+func (m *testTunRouteManager) ActivateForNode(server string) error { return nil }
+func (m *testTunRouteManager) UpdateNode(server string) error      { return m.updateErr }
+func (m *testTunRouteManager) EnsureBypass(target string) error    { return nil }
+func (m *testTunRouteManager) Close() error                        { return nil }
 
 func TestHandleConfigPutSwitchAndPersist(t *testing.T) {
 	dir := t.TempDir()
@@ -199,6 +209,100 @@ func TestHandleSwitchAutoSyncRoutingGroupEgressInMemory(t *testing.T) {
 	}
 	if got := strings.TrimSpace(state.cfg.Routing.GroupEgress["节点选择"]); got != "node-2" {
 		t.Fatalf("expected in-memory 节点选择 synced to node-2, got %q", got)
+	}
+}
+
+func TestHandleSwitchKeepsSelectedNodeWhenTunOnSwitchFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+
+	cfg := testClientConfig()
+	cfg.Nodes = append(cfg.Nodes, clientNodeConfig{
+		Name:     "node-2",
+		Server:   "node2.example.com:8443",
+		Password: "change-me-2",
+		SNI:      "node2.example.com",
+	})
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, loaded, configPath)
+	state.tun = &tunRuntime{
+		route:              &testTunRouteManager{updateErr: errors.New("mock tun update failed")},
+		routeBypassTargets: map[string]struct{}{},
+	}
+
+	resp := doJSONRequest(t, http.MethodPost, "/api/v1/switch", map[string]any{
+		"name": "node-2",
+	}, state.handleSwitch)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := state.manager.CurrentNodeName(); got != "node-2" {
+		t.Fatalf("expected current node switched to node-2 even with tun warning, got %s", got)
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if got := strings.TrimSpace(anyToString(out["switch_warning"])); got == "" {
+		t.Fatalf("expected switch_warning in response, body=%s", resp.Body.String())
+	}
+}
+
+func TestHandleSwitchKeepsSelectedNodeWhenManagerSwitchFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+
+	cfg := testClientConfig()
+	cfg.Nodes = append(cfg.Nodes, clientNodeConfig{
+		Name:     "node-bad",
+		Server:   "127.0.0.1:8443",
+		Password: "change-me-2",
+		SNI:      "node2.example.com",
+	})
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	loaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("load initial config failed: %v", err)
+	}
+	for i := range loaded.Nodes {
+		if strings.TrimSpace(loaded.Nodes[i].Name) == "node-bad" {
+			// Keep persisted config valid, then inject a runtime-only invalid URI
+			// so manager.Switch hits the degraded path in this test.
+			loaded.Nodes[i].URI = "socks5://bad"
+			break
+		}
+	}
+	state := newTestAPIState(t, loaded, configPath)
+
+	resp := doJSONRequest(t, http.MethodPost, "/api/v1/switch", map[string]any{
+		"name": "node-bad",
+	}, state.handleSwitch)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if got := state.manager.CurrentNodeName(); got != "node-bad" {
+		t.Fatalf("expected current node switched to node-bad even with manager warning, got %s", got)
+	}
+
+	var out map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	warn := strings.TrimSpace(anyToString(out["switch_warning"]))
+	if warn == "" {
+		t.Fatalf("expected switch_warning in response, body=%s", resp.Body.String())
+	}
+	if !strings.Contains(strings.ToLower(warn), "manager switch degraded") {
+		t.Fatalf("expected manager switch degraded warning, got %q", warn)
 	}
 }
 
