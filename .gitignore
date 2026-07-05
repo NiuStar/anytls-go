@@ -6,7 +6,8 @@
 .vscode
 /.idea/
 /docs
-/scripts/
+/scripts/*
+!/scripts/anytls-install_server.sh
 scripts/**/*.log
 scripts/**/*.tmp
 scripts/**/tmp/
