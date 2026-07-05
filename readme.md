@@ -209,8 +209,9 @@ Shadowrocket 2.2.65+ 实现了 anytls 协议的客户端。
 - `sni` 可选
 - `egress_ip` 可选
 - `egress_rule` 可选（按目标地址匹配服务端出口 IP，命中优先）
-- `allow_insecure` 可选（默认 `true`；建议设为 `false`）
+- `allow_insecure` 可选（默认 `false`，严格校验证书；仅自签名/兼容旧节点时显式设为 `true`）
 - `ca_cert_path` 可选（当 `allow_insecure=false` 时可指定自定义 CA 证书）
+- `cert_sha256` 可选（推荐用于无域名/无公网证书的一键自签名部署；客户端按服务端证书 SHA256 指纹做 pin 校验）
 - `tun` 可选（启用后在 `api` 模式下启用 TUN 透明接管）
 
 节点 JSON 示例（可直接用于其他仓库生成 `client.json`）：
@@ -223,6 +224,7 @@ Shadowrocket 2.2.65+ 实现了 anytls 协议的客户端。
   "sni": "example.com",
   "allow_insecure": false,
   "ca_cert_path": "/etc/anytls/ca.crt",
+  "cert_sha256": "",
   "egress_ip": "",
   "egress_rule": "",
   "groups": [
@@ -353,6 +355,24 @@ curl -fsSL https://ghfast.top/https://github.com/NiuStar/anytls-go/releases/late
   - 运行状态页会显示健康告警（例如 TUN 配置和运行态不一致）
 
 本地快速导入节点（推荐）：
+
+服务端无域名/无公网证书的一键导出（推荐）：
+
+```bash
+# 服务端首次配置：自动生成并持久化自签名证书，默认保存到 /etc/anytls/auto-cert
+anytls-server config edit --listen 0.0.0.0:8443 --password 'your-password' --auto-cert --yes
+
+# 导出客户端 URI：自动附带 cert-sha256，客户端无需配置域名、CA 或 allow_insecure
+anytls-server config export --addr YOUR_SERVER_IP:8443 --yes
+```
+
+导出的 URI 类似：
+
+```text
+anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>
+```
+
+客户端导入这条 URI 即可按证书指纹校验服务端；不需要申请域名证书，也不建议把 `allow_insecure=true` 当作一键部署方案。
 
 ```bash
 anytls-client cli add 'anytls://password@example.com:8443/?sni=example.com'

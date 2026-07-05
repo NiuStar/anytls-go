@@ -539,12 +539,13 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		SNI:           strings.TrimSpace(node.SNI),
 		AllowInsecure: allowInsecure,
 		CACertPath:    strings.TrimSpace(node.CACertPath),
+		CertSHA256:    strings.TrimSpace(node.CertSHA256),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
+	path := tlsKeyLogPathFromEnv(os.Getenv)
 	if path != "" {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 		if err == nil {
@@ -660,6 +661,22 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		}
 		return tlsConn, nil
 	}, minIdleSession, node.EgressIP, node.EgressRule, node.Password, label), nil
+}
+
+func tlsKeyLogPathFromEnv(getenv func(string) string) string {
+	if getenv == nil {
+		return ""
+	}
+	path := strings.TrimSpace(getenv("TLS_KEY_LOG"))
+	if path == "" {
+		return ""
+	}
+	switch strings.ToLower(strings.TrimSpace(getenv("ANYTLS_ENABLE_KEY_LOG"))) {
+	case "1", "true", "yes", "on":
+		return path
+	default:
+		return ""
+	}
 }
 
 func tlsClientHandshakeTimeout() time.Duration {

@@ -223,7 +223,7 @@ proxies:
 	if len(items) != 1 {
 		t.Fatalf("expected 1 item, got %d", len(items))
 	}
-	_, _, _, _, _, allowInsecure, caCertPath, err := parseAnyTLSURIWithOptions(items[0].URI)
+	_, _, _, _, _, allowInsecure, caCertPath, _, err := parseAnyTLSURIWithOptions(items[0].URI)
 	if err != nil {
 		t.Fatalf("parse anytls uri with options failed: %v", err)
 	}

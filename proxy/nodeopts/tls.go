@@ -9,6 +9,7 @@ import (
 type TLS struct {
 	AllowInsecure *bool
 	CACertPath    string
+	CertSHA256    string
 }
 
 const (
@@ -16,8 +17,9 @@ const (
 	AllowInsecureModeTrue    = "true"
 	AllowInsecureModeFalse   = "false"
 
-	// DefaultAllowInsecure keeps compatibility with legacy AnyTLS behavior.
-	DefaultAllowInsecure = true
+	// DefaultAllowInsecure uses secure-by-default certificate verification.
+	// Legacy/self-signed deployments can still opt in with allow_insecure=true.
+	DefaultAllowInsecure = false
 )
 
 func AllowInsecureModeValues() []string {
@@ -59,6 +61,7 @@ func ParseAllowInsecureMode(mode string) (*bool, bool) {
 
 func NormalizeTLS(in TLS) TLS {
 	in.CACertPath = strings.TrimSpace(in.CACertPath)
+	in.CertSHA256 = normalizeCertSHA256Text(in.CertSHA256)
 	in.AllowInsecure = CloneBoolPtr(in.AllowInsecure)
 	return in
 }
@@ -67,6 +70,12 @@ func ValidateTLS(in TLS) error {
 	in = NormalizeTLS(in)
 	if hasControlChars(in.CACertPath) {
 		return fmt.Errorf("ca_cert_path contains control characters")
+	}
+	if hasControlChars(in.CertSHA256) {
+		return fmt.Errorf("cert_sha256 contains control characters")
+	}
+	if in.CertSHA256 != "" && !isCertSHA256Hex(in.CertSHA256) {
+		return fmt.Errorf("cert_sha256 must be 64 hex characters")
 	}
 	return nil
 }
@@ -113,6 +122,27 @@ func CloneBoolPtr(v *bool) *bool {
 	}
 	out := *v
 	return &out
+}
+
+func normalizeCertSHA256Text(raw string) string {
+	out := strings.ToLower(strings.TrimSpace(raw))
+	out = strings.TrimPrefix(out, "sha256:")
+	out = strings.TrimPrefix(out, "sha256=")
+	out = strings.NewReplacer(":", "", " ", "", "-", "").Replace(out)
+	return out
+}
+
+func isCertSHA256Hex(raw string) bool {
+	if len(raw) != 64 {
+		return false
+	}
+	for _, r := range raw {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func hasControlChars(s string) bool {

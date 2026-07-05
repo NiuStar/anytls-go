@@ -62,7 +62,7 @@ func TestHandleStatus(t *testing.T) {
 	if !out.Tun.Enabled || out.Tun.Running {
 		t.Fatalf("unexpected tun status: %+v", out.Tun)
 	}
-	if out.Meta.NodeTLS.AllowInsecureDefaultMode != "true" || !out.Meta.NodeTLS.AllowInsecureDefault {
+	if out.Meta.NodeTLS.AllowInsecureDefaultMode != "false" || out.Meta.NodeTLS.AllowInsecureDefault {
 		t.Fatalf("unexpected node tls default meta: %+v", out.Meta.NodeTLS)
 	}
 	expectedModes := []string{"default", "true", "false"}

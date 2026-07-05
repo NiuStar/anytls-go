@@ -47,6 +47,7 @@ type clientNodeConfig struct {
 	EgressRule    string   `json:"egress_rule,omitempty"`
 	AllowInsecure *bool    `json:"allow_insecure,omitempty"`
 	CACertPath    string   `json:"ca_cert_path,omitempty"`
+	CertSHA256    string   `json:"cert_sha256,omitempty"`
 	Groups        []string `json:"groups,omitempty"`
 	SourceID      string   `json:"source_id,omitempty"`
 	URI           string   `json:"uri,omitempty"`
@@ -661,9 +662,11 @@ func normalizeNode(node *clientNodeConfig) error {
 	tlsFields := nodeopts.NormalizeTLS(nodeopts.TLS{
 		AllowInsecure: node.AllowInsecure,
 		CACertPath:    node.CACertPath,
+		CertSHA256:    node.CertSHA256,
 	})
 	node.AllowInsecure = cloneBoolPtr(tlsFields.AllowInsecure)
 	node.CACertPath = tlsFields.CACertPath
+	node.CertSHA256 = tlsFields.CertSHA256
 	node.Groups = normalizeNodeGroups(node.Groups)
 	node.SourceID = strings.TrimSpace(node.SourceID)
 	node.URI = strings.TrimSpace(node.URI)
@@ -677,7 +680,7 @@ func normalizeNode(node *clientNodeConfig) error {
 
 	if node.URI != "" {
 		if hasAnyTLSScheme(node.URI) {
-			server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseAnyTLSURIWithOptions(node.URI)
+			server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, certSHA256, err := parseAnyTLSURIWithOptions(node.URI)
 			if err != nil {
 				return fmt.Errorf("invalid uri: %w", err)
 			}
@@ -709,6 +712,9 @@ func normalizeNode(node *clientNodeConfig) error {
 			}
 			if node.CACertPath == "" {
 				node.CACertPath = caCertPath
+			}
+			if node.CertSHA256 == "" {
+				node.CertSHA256 = certSHA256
 			}
 		} else if spec, ok, err := parseSOCKSBridgeNodeURI(node.URI); ok {
 			if err != nil {
@@ -840,7 +846,7 @@ func stableSubscriptionID(seed string) string {
 }
 
 func parseAnyTLSURI(raw string) (server, password, sni, egressIP, egressRule string, err error) {
-	server, password, sni, egressIP, egressRule, _, _, err = parseAnyTLSURIWithOptions(raw)
+	server, password, sni, egressIP, egressRule, _, _, _, err = parseAnyTLSURIWithOptions(raw)
 	return
 }
 
@@ -858,10 +864,10 @@ func recoverLegacyAnyTLSSplitPassword(current, fromURI string) (string, bool) {
 	return fromURI, true
 }
 
-func parseAnyTLSURIWithOptions(raw string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string, err error) {
+func parseAnyTLSURIWithOptions(raw string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath, certSHA256 string, err error) {
 	parsed, err := anytlsuri.Parse(raw)
 	if err != nil {
-		return "", "", "", "", "", nil, "", err
+		return "", "", "", "", "", nil, "", "", err
 	}
 	server = parsed.Server
 	password = parsed.Password
@@ -870,10 +876,11 @@ func parseAnyTLSURIWithOptions(raw string) (server, password, sni, egressIP, egr
 	egressRule = parsed.EgressRule
 	allowInsecure = cloneBoolPtr(parsed.AllowInsecure)
 	caCertPath = parsed.CACertPath
+	certSHA256 = parsed.CertSHA256
 	return
 }
 
-func parseNodeURI(rawURI string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string, err error) {
+func parseNodeURI(rawURI string) (server, password, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath, certSHA256 string, err error) {
 	rawURI = strings.TrimSpace(rawURI)
 	if rawURI == "" {
 		err = fmt.Errorf("uri is required")
@@ -934,6 +941,7 @@ func buildAnyTLSURIFromNode(node clientNodeConfig) (string, error) {
 		EgressRule:    strings.TrimSpace(node.EgressRule),
 		AllowInsecure: cloneBoolPtr(node.AllowInsecure),
 		CACertPath:    strings.TrimSpace(node.CACertPath),
+		CertSHA256:    strings.TrimSpace(node.CertSHA256),
 	})
 }
 
@@ -980,7 +988,7 @@ func upsertNodeFromURI(cfg *clientProfileConfig, nodeName, rawURI string) (strin
 		return "", fmt.Errorf("uri is required")
 	}
 
-	server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, err := parseNodeURI(rawURI)
+	server, password, sni, egressIP, egressRule, allowInsecure, caCertPath, certSHA256, err := parseNodeURI(rawURI)
 	if err != nil {
 		return "", err
 	}
@@ -999,6 +1007,7 @@ func upsertNodeFromURI(cfg *clientProfileConfig, nodeName, rawURI string) (strin
 		EgressRule:    egressRule,
 		AllowInsecure: cloneBoolPtr(allowInsecure),
 		CACertPath:    caCertPath,
+		CertSHA256:    certSHA256,
 		URI:           rawURI,
 	}
 
@@ -1154,7 +1163,10 @@ func listClientConfigBackups(path string) ([]configBackupInfo, error) {
 		})
 	}
 	sort.Slice(backups, func(i, j int) bool {
-		return backups[i].ModTime.After(backups[j].ModTime)
+		// backupCurrentConfig embeds a fixed-width timestamp in the file name.
+		// Sorting by name is more stable than filesystem ModTime, whose
+		// resolution/order can vary across platforms and fast successive writes.
+		return backups[i].Name > backups[j].Name
 	})
 	return backups, nil
 }

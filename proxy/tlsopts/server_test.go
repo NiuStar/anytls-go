@@ -44,6 +44,7 @@ func TestBuildServerConfigCertDir(t *testing.T) {
 	if cfg == nil || len(cfg.Certificates) == 0 {
 		t.Fatalf("certificates should not be empty")
 	}
+	assertHardenedServerTLSConfig(t, cfg)
 }
 
 func TestBuildServerConfigCAMode(t *testing.T) {
@@ -66,6 +67,7 @@ func TestBuildServerConfigCAMode(t *testing.T) {
 	if cfg == nil || cfg.GetCertificate == nil {
 		t.Fatalf("GetCertificate should not be nil")
 	}
+	assertHardenedServerTLSConfig(t, cfg)
 	cert, err := cfg.GetCertificate(&tls.ClientHelloInfo{ServerName: "example.com"})
 	if err != nil {
 		t.Fatalf("GetCertificate failed: %v", err)
@@ -93,12 +95,47 @@ func TestBuildServerConfigAuto(t *testing.T) {
 	if cfg == nil || cfg.GetCertificate == nil {
 		t.Fatalf("GetCertificate should not be nil")
 	}
+	assertHardenedServerTLSConfig(t, cfg)
 	cert, err := cfg.GetCertificate(nil)
 	if err != nil {
 		t.Fatalf("GetCertificate failed: %v", err)
 	}
 	if cert == nil {
 		t.Fatalf("certificate should not be nil")
+	}
+}
+
+func TestBuildServerConfigAutoCertDirPersists(t *testing.T) {
+	dir := t.TempDir()
+	cfg, mode, err := BuildServerConfig(ServerOptions{Listen: "127.0.0.1:8443", AutoCertDir: dir})
+	if err != nil {
+		t.Fatalf("build auto cert dir config failed: %v", err)
+	}
+	if mode != "auto-cert-dir" {
+		t.Fatalf("unexpected mode: %s", mode)
+	}
+	if cfg == nil || len(cfg.Certificates) == 0 {
+		t.Fatalf("expected loaded auto certificate")
+	}
+	assertHardenedServerTLSConfig(t, cfg)
+	firstFP, err := CertificateSHA256FromPEMFile(filepath.Join(dir, AutoCertFileName))
+	if err != nil {
+		t.Fatalf("read auto cert fingerprint failed: %v", err)
+	}
+
+	cfg2, mode, err := BuildServerConfig(ServerOptions{Listen: "127.0.0.1:8443", AutoCertDir: dir})
+	if err != nil {
+		t.Fatalf("rebuild auto cert dir config failed: %v", err)
+	}
+	if mode != "auto-cert-dir" || cfg2 == nil || len(cfg2.Certificates) == 0 {
+		t.Fatalf("unexpected second build: mode=%s cfg=%#v", mode, cfg2)
+	}
+	secondFP, err := CertificateSHA256FromPEMFile(filepath.Join(dir, AutoCertFileName))
+	if err != nil {
+		t.Fatalf("read second auto cert fingerprint failed: %v", err)
+	}
+	if firstFP == "" || firstFP != secondFP {
+		t.Fatalf("auto cert fingerprint should persist across builds: %q vs %q", firstFP, secondFP)
 	}
 }
 
@@ -154,4 +191,20 @@ func writeSelfSignedCA(t *testing.T, certPath, keyPath string) error {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	return os.WriteFile(keyPath, keyPEM, 0600)
+}
+
+func assertHardenedServerTLSConfig(t *testing.T, cfg *tls.Config) {
+	t.Helper()
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("unexpected MinVersion: got %#x want TLS1.2", cfg.MinVersion)
+	}
+	if len(cfg.CipherSuites) == 0 {
+		t.Fatalf("expected explicit hardened TLS 1.2 cipher suite allowlist")
+	}
+	if len(cfg.CurvePreferences) == 0 || cfg.CurvePreferences[0] != tls.X25519 {
+		t.Fatalf("expected X25519-first curve preferences, got %#v", cfg.CurvePreferences)
+	}
+	if !cfg.SessionTicketsDisabled {
+		t.Fatalf("server should disable TLS session tickets by default")
+	}
 }

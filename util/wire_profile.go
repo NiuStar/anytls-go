@@ -7,7 +7,7 @@ import (
 
 const (
 	defaultWireUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.7632.110 Safari/537.36"
-	defaultWireClientTag = "client/2"
+	defaultWireClientTag = ""
 	defaultMITMCACN      = "Local Root CA"
 	defaultMITMCAOrg     = "Local Trust Services"
 )
@@ -36,8 +36,8 @@ func WireUserAgent() string {
 	return sanitizeWireToken(os.Getenv("ANYTLS_WIRE_USER_AGENT"), defaultWireUserAgent, 256)
 }
 
-// WireClientTag returns the value carried in session cmdSettings "client" field.
-// Override via ANYTLS_WIRE_CLIENT_TAG when needed.
+// WireClientTag returns the optional value carried in session cmdSettings "client" field.
+// Empty by default; override via ANYTLS_WIRE_CLIENT_TAG when needed for diagnostics.
 func WireClientTag() string {
 	return sanitizeWireToken(os.Getenv("ANYTLS_WIRE_CLIENT_TAG"), defaultWireClientTag, 96)
 }

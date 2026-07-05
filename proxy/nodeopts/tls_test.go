@@ -97,7 +97,7 @@ func TestAllowInsecureModeRoundtrip(t *testing.T) {
 	if mode := AllowInsecureModeFromBool(false); mode != AllowInsecureModeFalse {
 		t.Fatalf("AllowInsecureModeFromBool(false) mismatch: %s", mode)
 	}
-	if !DefaultAllowInsecure {
-		t.Fatalf("DefaultAllowInsecure should keep legacy=true behavior")
+	if DefaultAllowInsecure {
+		t.Fatalf("DefaultAllowInsecure should default to strict certificate verification")
 	}
 }

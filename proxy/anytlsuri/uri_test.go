@@ -6,7 +6,7 @@ import (
 )
 
 func TestParseWithTLSOptions(t *testing.T) {
-	node, err := Parse("anytls://pass%40word@example.com:443?sni=test.example&egress-ip=203.0.113.9&egress-rule=all%3D203.0.113.1&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt")
+	node, err := Parse("anytls://pass%40word@example.com:443?sni=test.example&egress-ip=203.0.113.9&egress-rule=all%3D203.0.113.1&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt&cert-sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -31,6 +31,9 @@ func TestParseWithTLSOptions(t *testing.T) {
 	if node.CACertPath != "/etc/anytls/ca.crt" {
 		t.Fatalf("ca_cert_path mismatch: %q", node.CACertPath)
 	}
+	if node.CertSHA256 != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("cert_sha256 mismatch: %q", node.CertSHA256)
+	}
 }
 
 func TestBuildWithTLSOptions(t *testing.T) {
@@ -43,6 +46,7 @@ func TestBuildWithTLSOptions(t *testing.T) {
 		EgressRule:    "all=203.0.113.1",
 		AllowInsecure: &allowInsecure,
 		CACertPath:    "/etc/anytls/ca.crt",
+		CertSHA256:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 	})
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
@@ -62,6 +66,9 @@ func TestBuildWithTLSOptions(t *testing.T) {
 	}
 	if node.CACertPath != "/etc/anytls/ca.crt" {
 		t.Fatalf("ca_cert_path mismatch: %q", node.CACertPath)
+	}
+	if node.CertSHA256 != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" {
+		t.Fatalf("cert_sha256 mismatch: %q", node.CertSHA256)
 	}
 }
 

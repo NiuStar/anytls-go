@@ -1,6 +1,70 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func TestFinishTunStartResultKeepsRuntimeContextUntilClose(t *testing.T) {
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	rt, err := finishTunStartResult(tunStartResult{runtime: &tunRuntime{}}, runtimeCancel)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rt == nil {
+		t.Fatalf("expected runtime")
+	}
+	select {
+	case <-runtimeCtx.Done():
+		t.Fatalf("runtime context was cancelled before runtime close")
+	default:
+	}
+	if err := rt.Close(); err != nil {
+		t.Fatalf("close runtime: %v", err)
+	}
+	select {
+	case <-runtimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("runtime context was not cancelled after runtime close")
+	}
+}
+
+func TestFinishTunStartResultCancelsWhenNoRuntimeOwnsContext(t *testing.T) {
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	rt, err := finishTunStartResult(tunStartResult{}, runtimeCancel)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if rt != nil {
+		t.Fatalf("expected nil runtime")
+	}
+	select {
+	case <-runtimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("runtime context was not cancelled")
+	}
+}
+
+func TestFinishTunStartResultCancelsWhenRuntimeAlreadyClosed(t *testing.T) {
+	runtimeCtx, runtimeCancel := context.WithCancel(context.Background())
+	rt := &tunRuntime{}
+	if err := rt.Close(); err != nil {
+		t.Fatalf("close runtime: %v", err)
+	}
+	got, err := finishTunStartResult(tunStartResult{runtime: rt}, runtimeCancel)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != rt {
+		t.Fatalf("unexpected runtime returned")
+	}
+	select {
+	case <-runtimeCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatalf("runtime context was not cancelled for already closed runtime")
+	}
+}
 
 func TestParseDarwinRouteGetOutputWithGateway(t *testing.T) {
 	out := "route to: default\ninterface: en0\ngateway: 192.168.1.1\nflags: <UP,DONE,STATIC>\n"

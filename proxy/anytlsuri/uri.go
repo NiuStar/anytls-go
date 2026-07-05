@@ -15,6 +15,7 @@ type Node struct {
 	EgressRule    string
 	AllowInsecure *bool
 	CACertPath    string
+	CertSHA256    string
 }
 
 func HasScheme(raw string) bool {
@@ -55,6 +56,7 @@ func Parse(raw string) (Node, error) {
 	out.EgressIP = strings.TrimSpace(q.Get("egress-ip"))
 	out.EgressRule = strings.TrimSpace(q.Get("egress-rule"))
 	out.CACertPath = strings.TrimSpace(firstQueryValue(q, "ca-cert-path", "ca_cert_path", "ca-cert", "ca_cert"))
+	out.CertSHA256 = strings.TrimSpace(firstQueryValue(q, "cert-sha256", "cert_sha256", "certificate-sha256", "certificate_sha256", "fingerprint", "fingerprint-sha256", "fingerprint_sha256"))
 	if rawInsecure := firstQueryValue(q, "insecure", "allow-insecure", "allow_insecure", "skip-cert-verify", "skip_cert_verify"); rawInsecure != "" {
 		out.AllowInsecure = nodeopts.ParseOptionalBoolLoose(rawInsecure)
 	}
@@ -93,6 +95,9 @@ func Build(node Node) (string, error) {
 	}
 	if s := strings.TrimSpace(node.CACertPath); s != "" {
 		q.Set("ca-cert-path", s)
+	}
+	if s := strings.TrimSpace(node.CertSHA256); s != "" {
+		q.Set("cert-sha256", s)
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil

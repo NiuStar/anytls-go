@@ -33,6 +33,8 @@ type tunRuntime struct {
 	route tunRouteManager
 
 	routeNodeServer     string
+	closed              bool
+	runtimeCancel       context.CancelFunc
 	routeMaintainCancel context.CancelFunc
 	routeBypassTargets  map[string]struct{}
 	darwinDNSManaged    bool
@@ -286,10 +288,7 @@ func startTunRuntimeWithTimeout(ctx context.Context, cfg clientTunConfig, socksL
 		runtimeCancel()
 		return nil, ctx.Err()
 	case result := <-ch:
-		if result.err != nil {
-			runtimeCancel()
-		}
-		return result.runtime, result.err
+		return finishTunStartResult(result, runtimeCancel)
 	case <-time.After(timeout):
 		runtimeCancel()
 		go func() {
@@ -302,6 +301,28 @@ func startTunRuntimeWithTimeout(ctx context.Context, cfg clientTunConfig, socksL
 		}()
 		return nil, fmt.Errorf("start tun runtime timeout after %s", timeout)
 	}
+}
+
+func finishTunStartResult(result tunStartResult, runtimeCancel context.CancelFunc) (*tunRuntime, error) {
+	if result.err != nil || result.runtime == nil {
+		runtimeCancel()
+		return result.runtime, result.err
+	}
+	result.runtime.attachRuntimeCancel(runtimeCancel)
+	return result.runtime, nil
+}
+
+func (t *tunRuntime) attachRuntimeCancel(cancel context.CancelFunc) {
+	if t == nil || cancel == nil {
+		return
+	}
+	t.lock.Lock()
+	defer t.lock.Unlock()
+	if t.closed {
+		cancel()
+		return
+	}
+	t.runtimeCancel = cancel
 }
 
 func resolveTunStartTimeout(cfg clientTunConfig, requested time.Duration) time.Duration {
@@ -362,6 +383,18 @@ func (t *tunRuntime) Close() error {
 	defer t.lock.Unlock()
 
 	var firstErr error
+	if t.closed {
+		if t.runtimeCancel != nil {
+			t.runtimeCancel()
+			t.runtimeCancel = nil
+		}
+		return nil
+	}
+	t.closed = true
+	if t.runtimeCancel != nil {
+		t.runtimeCancel()
+		t.runtimeCancel = nil
+	}
 	if t.routeMaintainCancel != nil {
 		t.routeMaintainCancel()
 		t.routeMaintainCancel = nil

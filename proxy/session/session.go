@@ -122,8 +122,10 @@ func (s *Session) Run() {
 
 	settings := util.StringMap{
 		"v":           "2",
-		"client":      util.WireClientTag(),
 		"padding-md5": s.padding.Load().Md5,
+	}
+	if clientTag := util.WireClientTag(); clientTag != "" {
+		settings["client"] = clientTag
 	}
 	for k, v := range s.clientSettings {
 		if k != "" && v != "" {

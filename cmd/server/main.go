@@ -110,7 +110,17 @@ func runServer(args []string) {
 		logrus.Fatalln("listen server tcp:", err)
 	}
 
-	tlsConfig, tlsMode, err := buildServerTLSConfig(*listen, *certDir, *certFile, *keyFile, *caCert, *caKey)
+	autoCertDir := ""
+	if serverUsesAutoCert(serverEnvConfig{
+		CertDir:    strings.TrimSpace(*certDir),
+		CertFile:   strings.TrimSpace(*certFile),
+		KeyFile:    strings.TrimSpace(*keyFile),
+		CACertFile: strings.TrimSpace(*caCert),
+		CAKeyFile:  strings.TrimSpace(*caKey),
+	}) {
+		autoCertDir = defaultServerAutoCertDir()
+	}
+	tlsConfig, tlsMode, err := buildServerTLSConfig(*listen, *certDir, *certFile, *keyFile, *caCert, *caKey, autoCertDir)
 	if err != nil {
 		logrus.Fatalln("build tls config failed:", err)
 	}
@@ -221,13 +231,14 @@ func runServer(args []string) {
 	}
 }
 
-func buildServerTLSConfig(listen, certDir, certFile, keyFile, caCertFile, caKeyFile string) (*tls.Config, string, error) {
+func buildServerTLSConfig(listen, certDir, certFile, keyFile, caCertFile, caKeyFile, autoCertDir string) (*tls.Config, string, error) {
 	return tlsopts.BuildServerConfig(tlsopts.ServerOptions{
-		Listen:     strings.TrimSpace(listen),
-		CertDir:    strings.TrimSpace(certDir),
-		CertFile:   strings.TrimSpace(certFile),
-		KeyFile:    strings.TrimSpace(keyFile),
-		CACertFile: strings.TrimSpace(caCertFile),
-		CAKeyFile:  strings.TrimSpace(caKeyFile),
+		Listen:      strings.TrimSpace(listen),
+		CertDir:     strings.TrimSpace(certDir),
+		CertFile:    strings.TrimSpace(certFile),
+		KeyFile:     strings.TrimSpace(keyFile),
+		CACertFile:  strings.TrimSpace(caCertFile),
+		CAKeyFile:   strings.TrimSpace(caKeyFile),
+		AutoCertDir: strings.TrimSpace(autoCertDir),
 	})
 }

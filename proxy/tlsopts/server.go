@@ -19,12 +19,13 @@ import (
 )
 
 type ServerOptions struct {
-	Listen     string
-	CertDir    string
-	CertFile   string
-	KeyFile    string
-	CACertFile string
-	CAKeyFile  string
+	Listen      string
+	CertDir     string
+	CertFile    string
+	KeyFile     string
+	CACertFile  string
+	CAKeyFile   string
+	AutoCertDir string
 }
 
 type serverCAIssuer struct {
@@ -44,7 +45,9 @@ func BuildServerConfig(opts ServerOptions) (*tls.Config, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("load cert-file/key-file failed: %w", err)
 		}
-		return &tls.Config{Certificates: []tls.Certificate{tlsCert}}, "cert-file", nil
+		cfg := newServerTLSConfig()
+		cfg.Certificates = []tls.Certificate{tlsCert}
+		return cfg, "cert-file", nil
 	}
 
 	if opts.CertDir != "" {
@@ -54,7 +57,9 @@ func BuildServerConfig(opts ServerOptions) (*tls.Config, string, error) {
 		if err != nil {
 			return nil, "", fmt.Errorf("load cert failed (cert-dir should contain server.crt and server.key): %w", err)
 		}
-		return &tls.Config{Certificates: []tls.Certificate{tlsCert}}, "cert-dir", nil
+		cfg := newServerTLSConfig()
+		cfg.Certificates = []tls.Certificate{tlsCert}
+		return cfg, "cert-dir", nil
 	}
 
 	if opts.CACertFile != "" || opts.CAKeyFile != "" {
@@ -69,38 +74,51 @@ func BuildServerConfig(opts ServerOptions) (*tls.Config, string, error) {
 		cache := make(map[string]*tls.Certificate)
 		var cacheMu sync.Mutex
 
-		cfg := &tls.Config{
-			GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-				name := ""
-				if chi != nil {
-					name = strings.TrimSpace(chi.ServerName)
-				}
-				if name == "" {
-					name = defaultName
-				}
-				if name == "" {
-					name = "localhost"
-				}
-				key := strings.ToLower(name)
+		cfg := newServerTLSConfig()
+		cfg.GetCertificate = func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			name := ""
+			if chi != nil {
+				name = strings.TrimSpace(chi.ServerName)
+			}
+			if name == "" {
+				name = defaultName
+			}
+			if name == "" {
+				name = "localhost"
+			}
+			key := strings.ToLower(name)
 
-				cacheMu.Lock()
-				cached := cache[key]
-				cacheMu.Unlock()
-				if cached != nil {
-					return cached, nil
-				}
+			cacheMu.Lock()
+			cached := cache[key]
+			cacheMu.Unlock()
+			if cached != nil {
+				return cached, nil
+			}
 
-				issued, issueErr := issueServerCertFromCA(issuer, name, time.Now())
-				if issueErr != nil {
-					return nil, issueErr
-				}
-				cacheMu.Lock()
-				cache[key] = issued
-				cacheMu.Unlock()
-				return issued, nil
-			},
+			issued, issueErr := issueServerCertFromCA(issuer, name, time.Now())
+			if issueErr != nil {
+				return nil, issueErr
+			}
+			cacheMu.Lock()
+			cache[key] = issued
+			cacheMu.Unlock()
+			return issued, nil
 		}
 		return cfg, "ca-cert+ca-key", nil
+	}
+
+	if dir := strings.TrimSpace(opts.AutoCertDir); dir != "" {
+		certPath, keyPath, _, err := EnsureServerCertDir(dir, opts.Listen)
+		if err != nil {
+			return nil, "", err
+		}
+		tlsCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, "", fmt.Errorf("load auto cert failed: %w", err)
+		}
+		cfg := newServerTLSConfig()
+		cfg.Certificates = []tls.Certificate{tlsCert}
+		return cfg, "auto-cert-dir", nil
 	}
 
 	defaultName := defaultServerCertNameFromListen(opts.Listen)
@@ -108,10 +126,9 @@ func BuildServerConfig(opts ServerOptions) (*tls.Config, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	cfg := &tls.Config{
-		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return tlsCert, nil
-		},
+	cfg := newServerTLSConfig()
+	cfg.GetCertificate = func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return tlsCert, nil
 	}
 	return cfg, "auto-generated", nil
 }
@@ -162,6 +179,7 @@ func normalizeServerOptions(opts ServerOptions) ServerOptions {
 	opts.KeyFile = strings.TrimSpace(opts.KeyFile)
 	opts.CACertFile = strings.TrimSpace(opts.CACertFile)
 	opts.CAKeyFile = strings.TrimSpace(opts.CAKeyFile)
+	opts.AutoCertDir = strings.TrimSpace(opts.AutoCertDir)
 	return opts
 }
 

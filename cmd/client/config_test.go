@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -156,6 +157,59 @@ func TestNormalizeNodeGroups(t *testing.T) {
 		if node.Groups[i] != want[i] {
 			t.Fatalf("unexpected groups[%d]: got=%q want=%q", i, node.Groups[i], want[i])
 		}
+	}
+}
+
+func TestNodeAllowInsecureDefaultsToStrictVerify(t *testing.T) {
+	node := clientNodeConfig{
+		Name:     "n1",
+		Server:   "example.com:443",
+		Password: "p1",
+	}
+	if nodeAllowInsecure(node) {
+		t.Fatalf("unset allow_insecure should not skip TLS certificate verification")
+	}
+
+	explicitTrue := true
+	node.AllowInsecure = &explicitTrue
+	if !nodeAllowInsecure(node) {
+		t.Fatalf("explicit allow_insecure=true should remain supported for compatibility")
+	}
+
+	explicitFalse := false
+	node.AllowInsecure = &explicitFalse
+	if nodeAllowInsecure(node) {
+		t.Fatalf("explicit allow_insecure=false should enforce strict TLS verification")
+	}
+}
+
+func TestTLSKeyLogRequiresExplicitDebugOptIn(t *testing.T) {
+	getenv := func(key string) string {
+		switch key {
+		case "TLS_KEY_LOG":
+			return "/tmp/sslkeys.log"
+		case "ANYTLS_ENABLE_KEY_LOG":
+			return ""
+		default:
+			return ""
+		}
+	}
+	if got := tlsKeyLogPathFromEnv(getenv); got != "" {
+		t.Fatalf("TLS_KEY_LOG without ANYTLS_ENABLE_KEY_LOG should be ignored, got %q", got)
+	}
+
+	getenv = func(key string) string {
+		switch key {
+		case "TLS_KEY_LOG":
+			return " /tmp/sslkeys.log "
+		case "ANYTLS_ENABLE_KEY_LOG":
+			return "true"
+		default:
+			return ""
+		}
+	}
+	if got := tlsKeyLogPathFromEnv(getenv); got != "/tmp/sslkeys.log" {
+		t.Fatalf("explicit key-log opt-in not honored, got %q", got)
 	}
 }
 
@@ -352,6 +406,16 @@ func TestSaveBackupAndRollback(t *testing.T) {
 	}
 	if len(backups) < 2 {
 		t.Fatalf("expected at least 2 backups, got %d", len(backups))
+	}
+	equalTime := time.Unix(1700000000, 0)
+	for _, backup := range backups {
+		if err := os.Chtimes(backup.Path, equalTime, equalTime); err != nil {
+			t.Fatalf("set equal backup modtime failed: %v", err)
+		}
+	}
+	backups, err = listClientConfigBackups(path)
+	if err != nil {
+		t.Fatalf("list backups after equal modtime failed: %v", err)
 	}
 
 	restored, err := rollbackClientConfig(path, backups[0].Name)

@@ -41,6 +41,7 @@ type exportedNode struct {
 	EgressRule    string `json:"egress_rule,omitempty"`
 	AllowInsecure *bool  `json:"allow_insecure,omitempty"`
 	CACertPath    string `json:"ca_cert_path,omitempty"`
+	CertSHA256    string `json:"cert_sha256,omitempty"`
 }
 
 type serverExportPreset struct {
@@ -188,6 +189,14 @@ func runServerConfigEdit(args []string) error {
 	if err := validateServerTLSConfig(cfg); err != nil {
 		return err
 	}
+	var autoCertSHA256 string
+	if serverUsesAutoCert(cfg) {
+		_, _, fp, err := tlsopts.EnsureServerCertDir(defaultServerAutoCertDirForConfig(*configPath), cfg.Listen)
+		if err != nil {
+			return fmt.Errorf("prepare auto cert failed: %w", err)
+		}
+		autoCertSHA256 = fp
+	}
 	if err := saveServerEnvConfig(*configPath, cfg); err != nil {
 		return err
 	}
@@ -204,7 +213,10 @@ func runServerConfigEdit(args []string) error {
 		fmt.Println("CA_CERT_FILE:", cfg.CACertFile)
 		fmt.Println("CA_KEY_FILE:", cfg.CAKeyFile)
 	default:
-		fmt.Println("CERT_DIR: (auto-generated)")
+		fmt.Println("CERT_DIR:", defaultServerAutoCertDirForConfig(*configPath), "(auto-generated)")
+		if autoCertSHA256 != "" {
+			fmt.Println("CERT_SHA256:", autoCertSHA256)
+		}
 	}
 	return nil
 }
@@ -221,6 +233,7 @@ func runServerConfigExport(args []string) error {
 	egressRule := fs.String("egress-rule", "", "egress-rule")
 	allowInsecureRaw := fs.String("allow-insecure", "", "export node allow_insecure (true/false), empty means omitted")
 	caCertPath := fs.String("ca-cert-path", "", "export node ca_cert_path")
+	certSHA256Raw := fs.String("cert-sha256", "", "export node cert_sha256; default auto-detects cert-file/cert-dir/auto-cert")
 	yes := fs.Bool("yes", false, "non-interactive mode")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -251,7 +264,8 @@ func runServerConfigExport(args []string) error {
 		strings.TrimSpace(*egressIP) != "" ||
 		strings.TrimSpace(*egressRule) != "" ||
 		strings.TrimSpace(*allowInsecureRaw) != "" ||
-		strings.TrimSpace(*caCertPath) != ""
+		strings.TrimSpace(*caCertPath) != "" ||
+		strings.TrimSpace(*certSHA256Raw) != ""
 
 	allowInsecure, err := parseOptionalBool(*allowInsecureRaw)
 	if err != nil {
@@ -357,6 +371,21 @@ func runServerConfigExport(args []string) error {
 	*egressIP = strings.TrimSpace(*egressIP)
 	*egressRule = strings.TrimSpace(*egressRule)
 	*caCertPath = strings.TrimSpace(*caCertPath)
+	certSHA256 := strings.TrimSpace(*certSHA256Raw)
+	if certSHA256 == "" {
+		var fpErr error
+		certSHA256, fpErr = exportCertSHA256ForConfig(*configPath, cfg)
+		if fpErr != nil {
+			return fpErr
+		}
+	}
+	if certSHA256 != "" {
+		normalized, err := tlsopts.NormalizeCertSHA256(certSHA256)
+		if err != nil {
+			return err
+		}
+		certSHA256 = normalized
+	}
 	if *nodePrefix == "" {
 		return fmt.Errorf("node-prefix is empty")
 	}
@@ -393,7 +422,7 @@ func runServerConfigExport(args []string) error {
 		if len(addrs) > 1 {
 			name = fmt.Sprintf("%s-%d", *nodePrefix, i+1)
 		}
-		uri, uriErr := buildNodeURI(cfg.Password, addr, *sni, *egressIP, *egressRule, allowInsecure, *caCertPath)
+		uri, uriErr := buildNodeURI(cfg.Password, addr, *sni, *egressIP, *egressRule, allowInsecure, *caCertPath, certSHA256)
 		if uriErr != nil {
 			return fmt.Errorf("build node uri failed for %s: %w", addr, uriErr)
 		}
@@ -404,6 +433,7 @@ func runServerConfigExport(args []string) error {
 			EgressRule:    *egressRule,
 			AllowInsecure: nodeopts.CloneBoolPtr(allowInsecure),
 			CACertPath:    *caCertPath,
+			CertSHA256:    certSHA256,
 		})
 	}
 
@@ -850,7 +880,7 @@ func isPublicIP(ipText string) bool {
 	return true
 }
 
-func buildNodeURI(password, addr, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath string) (string, error) {
+func buildNodeURI(password, addr, sni, egressIP, egressRule string, allowInsecure *bool, caCertPath, certSHA256 string) (string, error) {
 	return anytlsuri.Build(anytlsuri.Node{
 		Server:        strings.TrimSpace(addr),
 		Password:      strings.TrimSpace(password),
@@ -859,7 +889,45 @@ func buildNodeURI(password, addr, sni, egressIP, egressRule string, allowInsecur
 		EgressRule:    strings.TrimSpace(egressRule),
 		AllowInsecure: nodeopts.CloneBoolPtr(allowInsecure),
 		CACertPath:    strings.TrimSpace(caCertPath),
+		CertSHA256:    strings.TrimSpace(certSHA256),
 	})
+}
+
+func serverUsesAutoCert(cfg serverEnvConfig) bool {
+	return strings.TrimSpace(cfg.CertDir) == "" &&
+		strings.TrimSpace(cfg.CertFile) == "" &&
+		strings.TrimSpace(cfg.KeyFile) == "" &&
+		strings.TrimSpace(cfg.CACertFile) == "" &&
+		strings.TrimSpace(cfg.CAKeyFile) == ""
+}
+
+func defaultServerAutoCertDir() string {
+	return defaultServerAutoCertDirForConfig(defaultServerConfigPath())
+}
+
+func defaultServerAutoCertDirForConfig(configPath string) string {
+	if v := strings.TrimSpace(os.Getenv("ANYTLS_AUTO_CERT_DIR")); v != "" {
+		return v
+	}
+	dir := filepath.Dir(strings.TrimSpace(configPath))
+	if dir == "." || dir == "" {
+		dir = "/etc/anytls"
+	}
+	return filepath.Join(dir, "auto-cert")
+}
+
+func exportCertSHA256ForConfig(configPath string, cfg serverEnvConfig) (string, error) {
+	switch {
+	case strings.TrimSpace(cfg.CertDir) != "":
+		return tlsopts.CertificateSHA256FromPEMFile(filepath.Join(strings.TrimSpace(cfg.CertDir), tlsopts.AutoCertFileName))
+	case strings.TrimSpace(cfg.CertFile) != "":
+		return tlsopts.CertificateSHA256FromPEMFile(strings.TrimSpace(cfg.CertFile))
+	case serverUsesAutoCert(cfg):
+		_, _, fp, err := tlsopts.EnsureServerCertDir(defaultServerAutoCertDirForConfig(configPath), cfg.Listen)
+		return fp, err
+	default:
+		return "", nil
+	}
 }
 
 func parseOptionalBool(raw string) (*bool, error) {

@@ -14,6 +14,7 @@ type ClientOptions struct {
 	SNI           string
 	AllowInsecure bool
 	CACertPath    string
+	CertSHA256    string
 }
 
 func BuildClientConfig(opts ClientOptions) (*tls.Config, error) {
@@ -25,9 +26,25 @@ func BuildClientConfig(opts ClientOptions) (*tls.Config, error) {
 		return nil, fmt.Errorf("invalid server address %q: %w", server, err)
 	}
 
-	cfg := &tls.Config{
-		InsecureSkipVerify: opts.AllowInsecure,
+	certPin := strings.TrimSpace(opts.CertSHA256)
+	if certPin != "" {
+		cfg := newClientTLSConfig(false)
+		serverName := strings.TrimSpace(opts.SNI)
+		if serverName == "" {
+			host, _, splitErr := net.SplitHostPort(server)
+			if splitErr != nil {
+				return nil, fmt.Errorf("derive tls server name failed: %w", splitErr)
+			}
+			serverName = strings.TrimSpace(host)
+		}
+		cfg.ServerName = serverName
+		if err := applyCertificatePin(cfg, certPin); err != nil {
+			return nil, err
+		}
+		return cfg, nil
 	}
+
+	cfg := newClientTLSConfig(opts.AllowInsecure)
 	if opts.AllowInsecure {
 		cfg.ServerName = strings.TrimSpace(opts.SNI)
 		if cfg.ServerName == "" {
