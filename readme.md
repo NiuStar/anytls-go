@@ -21,7 +21,7 @@
 Release 版本提供 `anytls-install_server.sh`，适合 Linux + systemd 服务器直接安装、升级、修改配置、导出客户端 URI：
 
 ```bash
-curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh && chmod +x anytls-install_server.sh && sudo ./anytls-install_server.sh --install --password 'your-password' --addr YOUR_SERVER_IP:8443
+curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh && chmod +x anytls-install_server.sh && sudo ./anytls-install_server.sh --install --password 'your-password' --port 55555 --addr YOUR_SERVER_IP:55555
 ```
 
 脚本会自动完成：
@@ -32,6 +32,8 @@ curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-
 - 默认启用自动证书；
 - 最后调用 `anytls-server config export` 输出带 `cert-sha256` 的客户端导入 URI。
 
+参数说明：`--port` / `--listen` 是服务端实际监听端口；`--addr` 是写入客户端 URI 的连接地址，应该填公网 IP 或域名。若只传 `--addr IP:端口` 且没有传 `--port/--listen`，脚本会自动用 `--addr` 中的端口作为监听端口。
+
 也可以只运行交互菜单：
 
 ```bash
@@ -41,7 +43,7 @@ sudo ./anytls-install_server.sh
 菜单支持安装、卸载、更新、修改配置和导出节点。导出的 URI 可直接用于客户端：
 
 ```bash
-./anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>' node-main
+./anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:55555/?cert-sha256=<server-cert-sha256>' node-main
 ```
 
 ### 二进制手动配置服务端（无域名/无公网证书）

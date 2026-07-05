@@ -704,7 +704,16 @@ generate_random_password() {
 
 validate_direct_install_config() {
 	local port=""
-	[[ -n "$DIRECT_LISTEN" ]] || DIRECT_LISTEN="0.0.0.0:${DEFAULT_PORT}"
+	local export_port=""
+	if [[ -z "$DIRECT_LISTEN" ]]; then
+		if [[ -n "$DIRECT_EXPORT_ADDR" ]]; then
+			export_port="$(port_from_listen "$DIRECT_EXPORT_ADDR")"
+			DIRECT_LISTEN="0.0.0.0:${export_port}"
+			echo "未显式设置 --listen/--port，已根据 --addr 推导监听地址: $DIRECT_LISTEN"
+		else
+			DIRECT_LISTEN="0.0.0.0:${DEFAULT_PORT}"
+		fi
+	fi
 	port="$(port_from_listen "$DIRECT_LISTEN")"
 	[[ "$port" =~ ^[0-9]+$ ]] || fail "listen port must be numeric: $DIRECT_LISTEN"
 	((port >= 1 && port <= 65535)) || fail "listen port must be 1-65535: $port"
