@@ -15,6 +15,7 @@ func GenerateKeyPair(timeFunc func() time.Time, serverName string) (*tls.Certifi
 	if timeFunc == nil {
 		timeFunc = time.Now
 	}
+	now := timeFunc()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
@@ -25,8 +26,8 @@ func GenerateKeyPair(timeFunc func() time.Time, serverName string) (*tls.Certifi
 	}
 	template := &x509.Certificate{
 		SerialNumber:          serialNumber,
-		NotBefore:             timeFunc().Add(time.Hour * -1),
-		NotAfter:              timeFunc().Add(time.Hour),
+		NotBefore:             now.Add(time.Hour * -1),
+		NotAfter:              now.AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,

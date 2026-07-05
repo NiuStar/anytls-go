@@ -26,14 +26,24 @@ func EnsureServerCertDir(dir, listen string) (certPath, keyPath, certSHA256 stri
 	keyPath = filepath.Join(dir, AutoKeyFileName)
 
 	if fileExists(certPath) && fileExists(keyPath) {
-		if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		tlsCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
 			return "", "", "", fmt.Errorf("load auto cert failed: %w", err)
 		}
-		fp, err := CertificateSHA256FromPEMFile(certPath)
-		if err != nil {
-			return "", "", "", err
+		if len(tlsCert.Certificate) == 0 {
+			return "", "", "", fmt.Errorf("load auto cert failed: certificate chain is empty")
 		}
-		return certPath, keyPath, fp, nil
+		leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
+		if err != nil {
+			return "", "", "", fmt.Errorf("parse auto cert failed: %w", err)
+		}
+		if time.Now().Before(leaf.NotAfter) {
+			fp, err := CertificateSHA256FromPEMFile(certPath)
+			if err != nil {
+				return "", "", "", err
+			}
+			return certPath, keyPath, fp, nil
+		}
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", "", err

@@ -136,9 +136,9 @@ jobs:
             ## ${{ env.TAG }}
 
             ### Changes
-            - Add `anytls-install_server.sh` one-click Linux/systemd server deployment script.
-            - Installer creates `/etc/anytls/server.env`, installs `anytls-server.service`, enables auto certificate generation, and prints client import URIs via `anytls-server config export`.
-            - README documents one-click server deployment and client connection tests.
+            - Extend generated self-signed TLS certificates to 10-year validity.
+            - Regenerate persisted auto certificates when the existing certificate has expired.
+            - Keep the one-click auto-cert export flow compatible with `cert-sha256` client pinning.
 
             ### Verification
             - `bash -n scripts/anytls-install_server.sh`

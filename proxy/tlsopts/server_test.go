@@ -139,6 +139,39 @@ func TestBuildServerConfigAutoCertDirPersists(t *testing.T) {
 	}
 }
 
+func TestBuildServerConfigAutoCertDirRegeneratesExpiredCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, AutoCertFileName)
+	keyPath := filepath.Join(dir, AutoKeyFileName)
+	expiredAt := time.Now().Add(-1 * time.Hour)
+	if err := writeLeafPairAt(t, certPath, keyPath, "127.0.0.1", expiredAt.Add(-2*time.Hour), expiredAt); err != nil {
+		t.Fatalf("write expired leaf pair failed: %v", err)
+	}
+	expiredFP, err := CertificateSHA256FromPEMFile(certPath)
+	if err != nil {
+		t.Fatalf("read expired cert fingerprint failed: %v", err)
+	}
+
+	cfg, mode, err := BuildServerConfig(ServerOptions{Listen: "127.0.0.1:8443", AutoCertDir: dir})
+	if err != nil {
+		t.Fatalf("build auto cert dir config failed: %v", err)
+	}
+	if mode != "auto-cert-dir" || cfg == nil || len(cfg.Certificates) == 0 {
+		t.Fatalf("unexpected build result: mode=%s cfg=%#v", mode, cfg)
+	}
+	newFP, err := CertificateSHA256FromPEMFile(certPath)
+	if err != nil {
+		t.Fatalf("read regenerated cert fingerprint failed: %v", err)
+	}
+	if newFP == "" || newFP == expiredFP {
+		t.Fatalf("expired auto cert should be regenerated: expired=%q new=%q", expiredFP, newFP)
+	}
+	leaf := readLeafCertFromPEMFile(t, certPath)
+	if time.Until(leaf.NotAfter) < 9*365*24*time.Hour {
+		t.Fatalf("regenerated auto cert should be long lived, NotAfter=%s", leaf.NotAfter)
+	}
+}
+
 func writeLeafPair(t *testing.T, certPath, keyPath, serverName string) error {
 	t.Helper()
 	keypair, err := util.GenerateKeyPair(time.Now, serverName)
@@ -158,6 +191,58 @@ func writeLeafPair(t *testing.T, certPath, keyPath, serverName string) error {
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 	return os.WriteFile(keyPath, keyPEM, 0600)
+}
+
+func writeLeafPairAt(t *testing.T, certPath, keyPath, serverName string, notBefore, notAfter time.Time) error {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return err
+	}
+	tpl := &x509.Certificate{
+		SerialNumber:          serialNumber,
+		Subject:               pkix.Name{CommonName: serverName},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		return err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return os.WriteFile(keyPath, keyPEM, 0600)
+}
+
+func readLeafCertFromPEMFile(t *testing.T, certPath string) *x509.Certificate {
+	t.Helper()
+	raw, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read certificate failed: %v", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatalf("invalid certificate PEM in %s", certPath)
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse certificate failed: %v", err)
+	}
+	return leaf
 }
 
 func writeSelfSignedCA(t *testing.T, certPath, keyPath string) error {
