@@ -21,9 +21,7 @@
 Release 版本提供 `anytls-install_server.sh`，适合 Linux + systemd 服务器直接安装、升级、修改配置、导出客户端 URI：
 
 ```bash
-curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh
-chmod +x anytls-install_server.sh
-sudo ./anytls-install_server.sh --install --password 'your-password' --addr YOUR_SERVER_IP:8443
+curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh && chmod +x anytls-install_server.sh && sudo ./anytls-install_server.sh --install --password 'your-password' --addr YOUR_SERVER_IP:8443
 ```
 
 脚本会自动完成：
