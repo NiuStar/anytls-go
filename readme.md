@@ -14,44 +14,105 @@
 
 ## 快速食用方法
 
-为了方便，示例服务器和客户端默认采用不安全的配置，该配置假设您不会遭遇 TLS 中间人攻击（这种情况偶尔发生在网络接入层，在骨干网络上几乎不可能实现）；否则，您的通信内容可能会被中间人截获。
+推荐使用“服务端一键生成证书 + 导出带证书指纹的 URI”的方式部署。该方式不要求域名或公网 CA 证书，也不需要把客户端设置成 `allow_insecure=true`；客户端会按 `cert-sha256` 校验服务端证书，避免中间人伪造服务端。
 
-### 示例服务器
-
-```
-./anytls-server -l 0.0.0.0:8443 -p 密码
-```
-
-`0.0.0.0:8443` 为服务器监听的地址和端口。
-
-### 示例客户端
-
-```
-./anytls-client -l 127.0.0.1:1080 -s 服务器ip:端口 -p 密码
-```
-
-`127.0.0.1:1080` 为本机 Socks5 代理监听地址，理论上支持 TCP 和 UDP(通过 udp over tcp 传输)。
-
-如果需要让服务端使用指定出口 IP 发起代理请求，可增加参数：
-
-```
-./anytls-client -l 127.0.0.1:1080 -s 服务器ip:端口 -p 密码 --egress-ip 服务器本机IP
-```
-
-v0.0.12 版本起，示例客户端可直接使用 URI 格式:
-
-```
-./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port"
-```
-
-更安全的客户端 TLS 配置（推荐）：
+### 一键部署服务端（无域名/无公网证书）
 
 ```bash
-# 方式1：命令行
-./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port?sni=example.com&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt"
+# 1. 首次配置服务端：自动生成并持久化自签名证书
+./anytls-server config edit \
+  --listen 0.0.0.0:8443 \
+  --password 'your-password' \
+  --auto-cert \
+  --yes
 
-# 方式2：节点字段（API/WebUI/client.json）
-# allow_insecure=false + ca_cert_path=/etc/anytls/ca.crt
+# 2. 导出客户端 URI：自动附带 cert-sha256
+./anytls-server config export --addr YOUR_SERVER_IP:8443 --yes
+```
+
+导出的 URI 类似：
+
+```text
+anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>
+```
+
+说明：
+
+- `--auto-cert` 会在配置文件同目录下创建 `auto-cert/server.crt` 和 `auto-cert/server.key`；默认配置路径通常对应 `/etc/anytls/auto-cert/`。
+- 证书文件会被复用，服务端重启后 URI 中的 `cert-sha256` 仍然有效。
+- 如果删除 `auto-cert/` 后重新生成证书，证书指纹会变化，需要重新导出 URI 并更新客户端。
+- 不建议用 `allow_insecure=true` 作为一键部署方案；它会跳过证书校验，只适合临时排障或兼容旧节点。
+
+启动服务端：
+
+```bash
+./anytls-server
+```
+
+也可以继续使用命令行直启模式：
+
+```bash
+./anytls-server -l 0.0.0.0:8443 -p 'your-password'
+```
+
+但直启模式不会像 `config edit --auto-cert` 那样形成可复用的一键导出配置；面向普通用户部署时更推荐使用上面的配置模式。
+
+### 客户端导入并测试连接
+
+1. 首次运行客户端菜单，初始化本机配置并启动 API 模式：
+
+```bash
+./anytls-client
+```
+
+在菜单里选择“启动 API 模式”。也可以在已有配置文件时直接执行：
+
+```bash
+./anytls-client api
+```
+
+API 模式会启动：
+
+- 本地 SOCKS5：`127.0.0.1:1080`
+- 本地管理 API/WebUI：`127.0.0.1:18990`
+
+2. 新开一个终端，导入服务端导出的 URI：
+
+```bash
+./anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>' node-main
+```
+
+3. 查看状态和运行诊断：
+
+```bash
+./anytls-client cli status
+./anytls-client cli diagnose
+```
+
+4. 用本地 SOCKS5 实际访问测试：
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace
+```
+
+能返回 `ip=...` 等内容，说明客户端已经通过本地 SOCKS5 代理出网。也可以打开 Web 管理面板查看节点和诊断结果：
+
+```text
+http://127.0.0.1:18990/ui/
+```
+
+如果需要让服务端使用指定出口 IP 发起代理请求，可在客户端节点里配置 `egress_ip`，或命令行直连时增加：
+
+```bash
+./anytls-client -l 127.0.0.1:1080 -s 'anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>' --egress-ip 服务器本机IP
+```
+
+### 手动证书/CA 模式
+
+如果你已经有域名证书或自建 CA，也可以使用严格校验 + CA 文件：
+
+```bash
+./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port?sni=example.com&insecure=0&ca-cert-path=%2Fetc%2Fanytls%2Fca.crt"
 ```
 
 在其他 Go 仓库里复用 AnyTLS URI（含 `insecure`/`ca-cert-path`）：
@@ -107,8 +168,8 @@ if err := nodeopts.ValidateTLS(tlsNode); err != nil {
     panic(err)
 }
 
-// 兼容旧行为：未设置时默认 true
-allowInsecure := nodeopts.EffectiveAllowInsecure(tlsNode.AllowInsecure, true)
+// 推荐默认：未设置时按严格证书校验处理
+allowInsecure := nodeopts.EffectiveAllowInsecure(tlsNode.AllowInsecure, false)
 _ = allowInsecure
 ```
 
@@ -354,9 +415,9 @@ curl -fsSL https://ghfast.top/https://github.com/NiuStar/anytls-go/releases/late
   - 可通过环境变量调整：`ANYTLS_API_AUTH_MAX_FAILURES`、`ANYTLS_API_AUTH_LOCKOUT_SEC`
   - 运行状态页会显示健康告警（例如 TUN 配置和运行态不一致）
 
-本地快速导入节点（推荐）：
+本地快速导入节点并测试连接（推荐）：
 
-服务端无域名/无公网证书的一键导出（推荐）：
+服务端先执行一键配置并导出 URI：
 
 ```bash
 # 服务端首次配置：自动生成并持久化自签名证书，默认保存到 /etc/anytls/auto-cert
@@ -366,22 +427,38 @@ anytls-server config edit --listen 0.0.0.0:8443 --password 'your-password' --aut
 anytls-server config export --addr YOUR_SERVER_IP:8443 --yes
 ```
 
-导出的 URI 类似：
-
-```text
-anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>
-```
-
-客户端导入这条 URI 即可按证书指纹校验服务端；不需要申请域名证书，也不建议把 `allow_insecure=true` 当作一键部署方案。
+客户端先初始化配置并启动 API 模式。首次使用推荐直接运行菜单：
 
 ```bash
-anytls-client cli add 'anytls://password@example.com:8443/?sni=example.com'
+anytls-client
 ```
 
-也可以指定节点名：
+在菜单里选择“启动 API 模式”。已有配置文件时也可以直接启动：
 
 ```bash
-anytls-client cli add 'anytls://password@example.com:8443/?sni=example.com' 节点名
+anytls-client api
+```
+
+然后新开一个终端，复制服务端导出的 URI 并导入为节点：
+
+```bash
+anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>' node-main
+```
+
+验证状态、诊断和实际代理出网：
+
+```bash
+anytls-client cli status
+anytls-client cli diagnose
+curl --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace
+```
+
+也可以浏览器打开 `http://127.0.0.1:18990/ui/`，在 Web 管理面板查看节点、诊断和日志。
+
+如需指定节点名，`cli add` 的第二个参数就是节点名：
+
+```bash
+anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:8443/?cert-sha256=<server-cert-sha256>' 节点名
 ```
 
 外核桥接节点（支持 sing-box / mihomo 全协议栈）：
