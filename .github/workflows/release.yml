@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release, for example v0.0.24'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag }}" ]]; then
+            tag="${{ inputs.tag }}"
+            git fetch --tags --force
+            git checkout "$tag"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          version="${tag#v}"
+          if [[ -z "$version" || "$version" == "$tag" ]]; then
+            echo "Release tag must start with v, got: $tag" >&2
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/anytls-install_server.sh
+          go test -count=1 ./...
+
+      - name: Build release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="$PWD/dist/release"
+          work="$PWD/dist/work"
+          rm -rf "$dist" "$work"
+          mkdir -p "$dist" "$work"
+          ldflags="-s -w -X anytls/util.ProgramVersionName=anytls/${TAG} -X anytls/util.ProgramCommit=${COMMIT} -X anytls/util.ProgramBuildTime=${BUILD_TIME}"
+
+          build_one() {
+            local app="$1" pkg="$2" goos="$3" goarch="$4" archname="$5" goarm="${6:-}"
+            local outdir="$work/${app}_${goos}_${archname}"
+            local bin="$app"
+            rm -rf "$outdir"
+            mkdir -p "$outdir"
+            if [[ "$goos" == "windows" ]]; then
+              bin="${app}.exe"
+            fi
+            echo "building ${app} ${goos}/${goarch}${goarm:+ goarm=$goarm}"
+            GOOS="$goos" GOARCH="$goarch" GOARM="$goarm" CGO_ENABLED=0 \
+              go build -trimpath -buildvcs=false -ldflags "$ldflags" -o "$outdir/$bin" "$pkg"
+            if [[ "$goos" == "windows" ]]; then
+              (cd "$outdir" && zip -q "$dist/${app}_${VERSION}_${goos}_${archname}.zip" "$bin")
+            else
+              tar -C "$outdir" -czf "$dist/${app}_${VERSION}_${goos}_${archname}.tar.gz" "$bin"
+            fi
+          }
+
+          for item in "anytls-client ./cmd/client" "anytls-server ./cmd/server"; do
+            set -- $item
+            app="$1"
+            pkg="$2"
+            build_one "$app" "$pkg" darwin amd64 amd64
+            build_one "$app" "$pkg" darwin arm64 arm64
+            build_one "$app" "$pkg" linux 386 386
+            build_one "$app" "$pkg" linux amd64 amd64
+            build_one "$app" "$pkg" linux arm64 arm64
+            build_one "$app" "$pkg" linux arm arm_v7 7
+            build_one "$app" "$pkg" windows amd64 amd64
+            build_one "$app" "$pkg" windows arm64 arm64
+          done
+
+          install -m 0755 scripts/anytls-install_server.sh "$dist/anytls-install_server.sh"
+          for asset in anytls-client_manager.sh anytls-client_manager.ps1 anytls-install_client_openwrt.sh; do
+            curl -fsSL "https://github.com/NiuStar/anytls-go/releases/download/v0.0.23/${asset}" -o "$dist/${asset}"
+            chmod 0755 "$dist/${asset}" || true
+          done
+
+          (cd "$dist" && sha256sum * | sort -k2 > checksums.txt)
+          ls -lh "$dist"
+
+      - name: Smoke test linux amd64 assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          tar -xzf "dist/release/anytls-client_${VERSION}_linux_amd64.tar.gz" -C "$tmp"
+          "$tmp/anytls-client" --version | grep -F "anytls/${TAG}"
+          rm -rf "$tmp"
+          tmp="$(mktemp -d)"
+          tar -xzf "dist/release/anytls-server_${VERSION}_linux_amd64.tar.gz" -C "$tmp"
+          "$tmp/anytls-server" --version | grep -F "anytls/${TAG}"
+          "$tmp/anytls-server" config edit --config "$tmp/server.env" --listen 0.0.0.0:18444 --password release-test-pass --auto-cert --yes >/dev/null
+          "$tmp/anytls-server" config export --config "$tmp/server.env" --addr 127.0.0.1:18444 --yes | grep -F 'cert-sha256='
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          make_latest: true
+          files: dist/release/*
+          body: |
+            ## ${{ env.TAG }}
+
+            ### Changes
+            - Add `anytls-install_server.sh` one-click Linux/systemd server deployment script.
+            - Installer creates `/etc/anytls/server.env`, installs `anytls-server.service`, enables auto certificate generation, and prints client import URIs via `anytls-server config export`.
+            - README documents one-click server deployment and client connection tests.
+
+            ### Verification
+            - `bash -n scripts/anytls-install_server.sh`
+            - `go test -count=1 ./...`
+            - Release linux/amd64 smoke test: `--version` and server `config export` with `cert-sha256`.
