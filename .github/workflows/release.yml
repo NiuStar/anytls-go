@@ -136,11 +136,13 @@ jobs:
             ## ${{ env.TAG }}
 
             ### Changes
-            - Extend generated self-signed TLS certificates to 10-year validity.
-            - Regenerate persisted auto certificates when the existing certificate has expired.
-            - Keep the one-click auto-cert export flow compatible with `cert-sha256` client pinning.
+            - Harden the client control plane: write-only secrets, CSRF/origin checks, request-size limits, safer cookies, and HTTP timeouts.
+            - Protect client credentials and configuration files with restrictive permissions and remove plaintext server passwords from systemd process arguments.
+            - Harden server TLS/authentication handling, installer checksum verification, and systemd sandboxing.
+            - Honor `cert-sha256` in direct single-node `anytls://` URIs so mismatched certificate pins fail closed.
 
             ### Verification
             - `bash -n scripts/anytls-install_server.sh`
             - `go test -count=1 ./...`
             - Release linux/amd64 smoke test: `--version` and server `config export` with `cert-sha256`.
+            - End-to-end certificate-pin verification: the expected pin proxies successfully and an incorrect pin is rejected with an empty response.
