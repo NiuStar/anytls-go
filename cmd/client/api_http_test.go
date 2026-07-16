@@ -2,6 +2,9 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,5 +104,60 @@ func TestHTTPSProbeRetryBackoff(t *testing.T) {
 	}
 	if got := httpsProbeRetryBackoff(3); got != 420*time.Millisecond {
 		t.Fatalf("attempt3 backoff=%s", got)
+	}
+}
+
+func TestAuthClientKeyIgnoresUntrustedForwardedFor(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/v1/current", nil)
+	req.RemoteAddr = "192.0.2.10:43210"
+	req.Header.Set("X-Forwarded-For", "198.51.100.25")
+	if got := authClientKey(req); got != "192.0.2.10" {
+		t.Fatalf("auth client key=%q want real peer address", got)
+	}
+}
+
+func TestAPIRequestGuardRejectsCrossSiteMutation(t *testing.T) {
+	nextCalled := false
+	handler := apiRequestGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18990/api/v1/shutdown", nil)
+	req.Header.Set("Origin", "https://attacker.example")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("status=%d want=%d", resp.Code, http.StatusForbidden)
+	}
+	if nextCalled {
+		t.Fatalf("cross-site mutation reached protected handler")
+	}
+}
+
+func TestAPIRequestGuardAllowsCLIWithoutOrigin(t *testing.T) {
+	nextCalled := false
+	handler := apiRequestGuard(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:18990/api/v1/switch", strings.NewReader(`{"name":"node-1"}`))
+	resp := httptest.NewRecorder()
+
+	handler.ServeHTTP(resp, req)
+
+	if resp.Code != http.StatusNoContent || !nextCalled {
+		t.Fatalf("origin-less CLI request rejected: status=%d called=%v", resp.Code, nextCalled)
+	}
+}
+
+func TestDecodeJSONBodyRejectsOversizedRequest(t *testing.T) {
+	payload := `{"value":"` + strings.Repeat("x", apiMaxRequestBodyBytes) + `"}`
+	req := httptest.NewRequest(http.MethodPut, "http://127.0.0.1/api/v1/config", strings.NewReader(payload))
+	var out map[string]any
+	if err := decodeJSONBody(req, &out); err == nil {
+		t.Fatalf("expected oversized request body to be rejected")
 	}
 }

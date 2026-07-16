@@ -1,8 +1,11 @@
 package main
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -38,4 +41,45 @@ validate_direct_install_config >/tmp/anytls-installer-test-2.out
 	if err != nil {
 		t.Fatalf("installer argument regression failed: %v\n%s", err, string(out))
 	}
+}
+
+func TestInstallerSecurityHardening(t *testing.T) {
+	script := readInstallerScript(t)
+	if strings.Contains(script, `EnvironmentFile=$CONFIG_FILE`) {
+		t.Fatalf("installer must not expand secrets through systemd EnvironmentFile")
+	}
+	for _, required := range []string{
+		`--password-file "$PASSWORD_FILE"`,
+		`sha256sum -c`,
+		`NoNewPrivileges=true`,
+		`ProtectSystem=strict`,
+		`PrivateTmp=true`,
+		`CapabilityBoundingSet=`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("installer missing security hardening %q", required)
+		}
+	}
+}
+
+func TestInstallerDoesNotPassPasswordOnCommandLine(t *testing.T) {
+	script := readInstallerScript(t)
+	for _, forbidden := range []string{
+		`args=(-l "$LISTEN" -p "$PASSWORD")`,
+		`--password "$password"`,
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("installer must not pass password in process arguments: %q", forbidden)
+		}
+	}
+}
+
+func readInstallerScript(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join("..", "..", "scripts", "anytls-install_server.sh")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read installer script failed: %v", err)
+	}
+	return string(raw)
 }

@@ -7,6 +7,7 @@ INSTALL_BIN_PATH="$INSTALL_BIN_DIR/anytls-server"
 INSTALL_WORK_DIR="/opt/anytls"
 CONFIG_DIR="/etc/anytls"
 CONFIG_FILE="$CONFIG_DIR/server.env"
+PASSWORD_FILE="$CONFIG_DIR/server.password"
 EXPORT_LAST_FILE="$CONFIG_DIR/export_last.env"
 START_SCRIPT="$INSTALL_WORK_DIR/start.sh"
 SERVICE_NAME="anytls-server"
@@ -522,6 +523,37 @@ pick_asset_url() {
 	fail "no release asset found for linux/${arch}"
 }
 
+pick_checksums_url() {
+	local release_json="$1"
+	local line=""
+	while IFS= read -r line; do
+		case "$line" in
+		*/checksums.txt)
+			echo "$line"
+			return
+			;;
+		esac
+	done < <(printf '%s\n' "$release_json" | sed -n 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	fail "release is missing checksums.txt"
+}
+
+verify_release_asset() {
+	local archive_file="$1"
+	local checksums_file="$2"
+	local asset_name="$3"
+	local verify_dir=""
+	local expected_line=""
+
+	require_cmd sha256sum
+	expected_line="$(awk -v name="$asset_name" '$2 == name || $2 == "*" name { print; exit }' "$checksums_file")"
+	[[ -n "$expected_line" ]] || fail "release checksum does not list $asset_name"
+	verify_dir="$(dirname "$archive_file")/verify"
+	mkdir -p "$verify_dir"
+	ln -f "$archive_file" "$verify_dir/$asset_name"
+	printf '%s\n' "$expected_line" >"$verify_dir/checksums.txt"
+	(cd "$verify_dir" && sha256sum -c checksums.txt)
+}
+
 install_binary() {
 	local archive_file="$1"
 	local tmp_dir="$2"
@@ -553,23 +585,28 @@ write_config() {
 	local args=()
 
 	mkdir -p "$CONFIG_DIR"
+	chmod 0700 "$CONFIG_DIR"
+	umask 077
+	printf '%s\n' "$password" >"$PASSWORD_FILE"
+	chmod 0600 "$PASSWORD_FILE"
 	if [[ -x "$INSTALL_BIN_PATH" ]]; then
-		args=(config edit --config "$CONFIG_FILE" --listen "$listen_addr" --password "$password" --yes)
+		args=(config edit --config "$CONFIG_FILE" --listen "$listen_addr" --password-file "$PASSWORD_FILE" --yes)
 		if [[ -n "$cert_dir" ]]; then
 			args+=(--cert-dir "$cert_dir")
 		else
 			args+=(--auto-cert)
 		fi
 		"$INSTALL_BIN_PATH" "${args[@]}"
+		chmod 0600 "$CONFIG_FILE"
 		return
 	fi
 
-	umask 077
 	{
 		printf 'LISTEN=%q\n' "$listen_addr"
 		printf 'PASSWORD=%q\n' "$password"
 		printf 'CERT_DIR=%q\n' "$cert_dir"
 	} >"$CONFIG_FILE"
+	chmod 0600 "$CONFIG_FILE"
 }
 write_start_script() {
 	mkdir -p "$INSTALL_WORK_DIR"
@@ -578,8 +615,9 @@ write_start_script() {
 set -euo pipefail
 
 source /etc/anytls/server.env
+PASSWORD_FILE=/etc/anytls/server.password
 
-args=(-l "$LISTEN" -p "$PASSWORD")
+args=(-l "$LISTEN" --password-file "$PASSWORD_FILE")
 if [[ -n "${CERT_DIR:-}" ]]; then
 	args+=(--cert-dir "$CERT_DIR")
 fi
@@ -602,6 +640,25 @@ ExecStart=$START_SCRIPT
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=$CONFIG_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -614,8 +671,11 @@ download_latest_binary() {
 	local latest_json=""
 	local latest_tag=""
 	local asset_url=""
+	local checksums_url=""
+	local asset_name=""
 	local tmp_dir=""
 	local archive_file=""
+	local checksums_file=""
 
 	echo
 	echo "开始下载安装最新版本..."
@@ -624,10 +684,13 @@ download_latest_binary() {
 	latest_json="$(curl -fsSL "$(with_github_mirror "https://api.github.com/repos/${repo}/releases/latest")")"
 	latest_tag="$(extract_latest_release_tag "$repo" "$latest_json")"
 	asset_url="$(pick_asset_url "$latest_json" "$latest_tag" "$arch")"
+	checksums_url="$(pick_checksums_url "$latest_json")"
+	asset_name="${asset_url##*/}"
 	echo "Latest tag: $latest_tag"
 	echo "Asset: $asset_url"
 
 	tmp_dir="$(mktemp -d)"
+	checksums_file="$tmp_dir/checksums.txt"
 
 	archive_file="$tmp_dir/anytls-release-archive"
 	case "$asset_url" in
@@ -643,6 +706,8 @@ download_latest_binary() {
 	esac
 
 	curl -fL "$(with_github_mirror "$asset_url")" -o "$archive_file"
+	curl -fL "$(with_github_mirror "$checksums_url")" -o "$checksums_file"
+	verify_release_asset "$archive_file" "$checksums_file" "$asset_name"
 	install_binary "$archive_file" "$tmp_dir/extract"
 	rm -rf "$tmp_dir"
 }
@@ -839,7 +904,11 @@ modify_config_action() {
 
 	current_listen="${LISTEN:-0.0.0.0:${DEFAULT_PORT}}"
 	current_port="$(port_from_listen "$current_listen")"
-	current_password="${PASSWORD:-}"
+	if [[ -f "$PASSWORD_FILE" ]]; then
+		current_password="$(<"$PASSWORD_FILE")"
+	else
+		current_password="${PASSWORD:-}"
+	fi
 	current_cert_dir="${CERT_DIR:-}"
 
 	LISTEN_VALUE=""

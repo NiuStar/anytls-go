@@ -9,6 +9,33 @@ import (
 	"testing"
 )
 
+func TestResolveServerPasswordFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "password")
+	if err := os.WriteFile(path, []byte("secret-value\n"), 0600); err != nil {
+		t.Fatalf("write password file failed: %v", err)
+	}
+	got, err := resolveServerPassword("", path)
+	if err != nil {
+		t.Fatalf("resolve password failed: %v", err)
+	}
+	if got != "secret-value" {
+		t.Fatalf("password=%q want secret-value", got)
+	}
+}
+
+func TestResolveServerPasswordRejectsAmbiguousOrMultilineInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "password")
+	if err := os.WriteFile(path, []byte("line-one\nline-two\n"), 0600); err != nil {
+		t.Fatalf("write password file failed: %v", err)
+	}
+	if _, err := resolveServerPassword("direct", path); err == nil {
+		t.Fatalf("expected direct password plus password file to fail")
+	}
+	if _, err := resolveServerPassword("", path); err == nil {
+		t.Fatalf("expected multiline password file to fail")
+	}
+}
+
 func TestParseOptionalBool(t *testing.T) {
 	v, err := parseOptionalBool("")
 	if err != nil {
@@ -65,6 +92,31 @@ func TestBuildNodeURI_WithTLSFields(t *testing.T) {
 	}
 	if !strings.Contains(uri, "cert-sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") {
 		t.Fatalf("uri missing cert-sha256: %s", uri)
+	}
+}
+
+func TestServerConfigEditReadsPasswordFile(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "server.env")
+	passwordPath := filepath.Join(dir, "server.password")
+	if err := os.WriteFile(passwordPath, []byte("secret-from-file\n"), 0600); err != nil {
+		t.Fatalf("write password file failed: %v", err)
+	}
+	if err := runServerConfigEdit([]string{
+		"--config", configPath,
+		"--listen", "127.0.0.1:18443",
+		"--password-file", passwordPath,
+		"--auto-cert",
+		"--yes",
+	}); err != nil {
+		t.Fatalf("config edit with password file failed: %v", err)
+	}
+	cfg, err := loadServerEnvConfig(configPath)
+	if err != nil {
+		t.Fatalf("load generated config failed: %v", err)
+	}
+	if cfg.Password != "secret-from-file" {
+		t.Fatalf("generated password=%q", cfg.Password)
 	}
 }
 

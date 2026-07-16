@@ -708,7 +708,7 @@ func (s *apiState) subscriptionWithStatusLocked(sub clientSubscription) map[stri
 	resp := map[string]any{
 		"id":                  sub.ID,
 		"name":                sub.Name,
-		"url":                 sub.URL,
+		"url_set":             strings.TrimSpace(sub.URL) != "",
 		"enabled":             sub.Enabled,
 		"update_interval_sec": sub.UpdateIntervalSec,
 		"node_prefix":         sub.NodePrefix,

@@ -3,13 +3,14 @@ package main
 import (
 	"anytls/proxy/padding"
 	"anytls/proxy/session"
-	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"net"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -17,8 +18,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const serverInboundHandshakeTimeout = 10 * time.Second
+
 func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
-	rawConn := c
 	defer func() {
 		if r := recover(); r != nil {
 			logrus.Errorln("[BUG]", r, string(debug.Stack()))
@@ -32,42 +34,49 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 			_ = c.Close()
 		}
 	}()
+	if err := c.SetDeadline(time.Now().Add(serverInboundHandshakeTimeout)); err != nil {
+		return
+	}
+	tlsConn, ok := c.(*tls.Conn)
+	if !ok {
+		return
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		logrus.Debugln("tls handshake:", err)
+		return
+	}
 
 	b := buf.NewPacket()
 	defer b.Release()
 
-	n, err := b.ReadOnceFrom(c)
+	_, err := b.ReadOnceFrom(c)
 	if err != nil {
 		logrus.Debugln("ReadOnceFrom:", err)
-		fallback(ctx, rawConn)
-		closeConn = false
 		return
 	}
+	payload := append([]byte(nil), b.Bytes()...)
 	c = bufio.NewCachedConn(c, b)
 
 	by, err := b.ReadBytes(32)
-	if err != nil || !bytes.Equal(by, passwordSha256) {
-		b.Resize(0, n)
-		fallback(ctx, rawConn)
-		closeConn = false
+	if err != nil || subtle.ConstantTimeCompare(by, passwordSha256) != 1 {
+		fallbackTLS(c, payload)
 		return
 	}
 	by, err = b.ReadBytes(2)
 	if err != nil {
-		b.Resize(0, n)
-		fallback(ctx, rawConn)
-		closeConn = false
+		fallbackTLS(c, payload)
 		return
 	}
 	paddingLen := binary.BigEndian.Uint16(by)
 	if paddingLen > 0 {
 		_, err = b.ReadBytes(int(paddingLen))
 		if err != nil {
-			b.Resize(0, n)
-			fallback(ctx, rawConn)
-			closeConn = false
+			fallbackTLS(c, payload)
 			return
 		}
+	}
+	if err := c.SetDeadline(time.Time{}); err != nil {
+		return
 	}
 
 	session := session.NewServerSession(c, func(stream *session.Stream) {
@@ -94,40 +103,36 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	session.Close()
 }
 
-func fallback(ctx context.Context, c net.Conn) {
+func closeInboundConnection(c net.Conn) {
+	if c != nil {
+		_ = c.Close()
+	}
+}
+
+func fallbackTLS(c net.Conn, payload []byte) {
 	if c == nil {
 		return
 	}
-	if tc := unwrapTCPConn(c); tc != nil {
-		_ = tc.SetLinger(0)
+	if looksLikeHTTPRequest(payload) {
+		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		_, _ = c.Write([]byte("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 10\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\nNot Found\n"))
 	}
-	_ = c.Close()
-	logrus.Debugln("fallback-rst:", c.RemoteAddr())
+	logrus.Debugln("fallback-close:", c.RemoteAddr())
 }
 
-func unwrapTCPConn(c net.Conn) *net.TCPConn {
-	current := c
-	for i := 0; i < 8 && current != nil; i++ {
-		if tc, ok := current.(*net.TCPConn); ok {
-			return tc
-		}
-		if unwrap, ok := current.(interface{ NetConn() net.Conn }); ok {
-			next := unwrap.NetConn()
-			if next == nil || next == current {
-				return nil
-			}
-			current = next
-			continue
-		}
-		if unwrap, ok := current.(interface{ Unwrap() net.Conn }); ok {
-			next := unwrap.Unwrap()
-			if next == nil || next == current {
-				return nil
-			}
-			current = next
-			continue
-		}
-		return nil
+func looksLikeHTTPRequest(payload []byte) bool {
+	lineEnd := strings.Index(string(payload), "\r\n")
+	if lineEnd <= 0 || lineEnd > 8192 {
+		return false
 	}
-	return nil
+	parts := strings.Split(string(payload[:lineEnd]), " ")
+	if len(parts) != 3 || (parts[2] != "HTTP/1.1" && parts[2] != "HTTP/1.0") {
+		return false
+	}
+	switch parts[0] {
+	case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE":
+		return strings.HasPrefix(parts[1], "/") || parts[0] == "CONNECT"
+	default:
+		return false
+	}
 }

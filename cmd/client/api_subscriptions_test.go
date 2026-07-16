@@ -2,11 +2,76 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestSubscriptionAPIKeepsURLWriteOnly(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	cfg.Subscriptions = []clientSubscription{{
+		ID:                "private-sub",
+		Name:              "Private",
+		URL:               "https://example.com/sub?token=top-secret",
+		Enabled:           true,
+		UpdateIntervalSec: 3600,
+	}}
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, cfg, configPath)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/subscriptions", nil)
+	getResp := httptest.NewRecorder()
+	state.handleSubscriptions(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var listed struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(getResp.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode subscriptions failed: %v", err)
+	}
+	if len(listed.Items) != 1 {
+		t.Fatalf("unexpected subscription count: %d", len(listed.Items))
+	}
+	if _, exists := listed.Items[0]["url"]; exists {
+		t.Fatalf("subscription response must omit URL: %+v", listed.Items[0])
+	}
+	if set, _ := listed.Items[0]["url_set"].(bool); !set {
+		t.Fatalf("subscription response missing url_set: %+v", listed.Items[0])
+	}
+	if strings.Contains(getResp.Body.String(), "top-secret") {
+		t.Fatalf("subscription response leaked token: %s", getResp.Body.String())
+	}
+
+	putResp := doJSONRequest(t, http.MethodPut, "/api/v1/subscriptions/private-sub", map[string]any{
+		"name": "Renamed",
+	}, state.handleSubscriptionByID)
+	if putResp.Code != http.StatusOK {
+		t.Fatalf("unexpected PUT status: %d body=%s", putResp.Code, putResp.Body.String())
+	}
+	if strings.Contains(putResp.Body.String(), "top-secret") {
+		t.Fatalf("subscription PUT response leaked token: %s", putResp.Body.String())
+	}
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if len(reloaded.Subscriptions) != 1 || reloaded.Subscriptions[0].URL != cfg.Subscriptions[0].URL {
+		t.Fatalf("partial update replaced subscription URL: %+v", reloaded.Subscriptions)
+	}
+	if reloaded.Subscriptions[0].Name != "Renamed" {
+		t.Fatalf("partial update did not change name: %+v", reloaded.Subscriptions[0])
+	}
+}
 
 func TestParseSubscriptionLines(t *testing.T) {
 	raw := `

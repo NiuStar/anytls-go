@@ -41,6 +41,28 @@ func main() {
 	runServer(os.Args[1:])
 }
 
+func resolveServerPassword(password, passwordFile string) (string, error) {
+	passwordFile = strings.TrimSpace(passwordFile)
+	if password != "" && passwordFile != "" {
+		return "", fmt.Errorf("set either -p or --password-file, not both")
+	}
+	if passwordFile == "" {
+		return password, nil
+	}
+	raw, err := os.ReadFile(passwordFile)
+	if err != nil {
+		return "", fmt.Errorf("read password file: %w", err)
+	}
+	value := strings.TrimRight(string(raw), "\r\n")
+	if value == "" {
+		return "", fmt.Errorf("password file is empty")
+	}
+	if strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("password file must contain exactly one line")
+	}
+	return value, nil
+}
+
 func isVersionArg(arg string) bool {
 	switch strings.TrimSpace(strings.ToLower(arg)) {
 	case "version", "-v", "--version", "-version":
@@ -54,6 +76,7 @@ func runServer(args []string) {
 	fs := flag.NewFlagSet("anytls-server", flag.ExitOnError)
 	listen := fs.String("l", "0.0.0.0:8443", "server listen port")
 	password := fs.String("p", "", "password")
+	passwordFile := fs.String("password-file", "", "read password from a file")
 	certDir := fs.String("cert-dir", "", "TLS cert directory (expects server.crt and server.key)")
 	certFile := fs.String("cert-file", "", "TLS cert file path")
 	keyFile := fs.String("key-file", "", "TLS key file path")
@@ -62,7 +85,11 @@ func runServer(args []string) {
 	paddingScheme := fs.String("padding-scheme", "", "padding-scheme")
 	_ = fs.Parse(args)
 
-	if *password == "" {
+	resolvedPassword, err := resolveServerPassword(*password, *passwordFile)
+	if err != nil {
+		logrus.Fatalln(err)
+	}
+	if resolvedPassword == "" {
 		logrus.Fatalln("please set password")
 	}
 	if *paddingScheme != "" {
@@ -88,7 +115,7 @@ func runServer(args []string) {
 	}
 	logrus.SetLevel(logLevel)
 
-	var sum = sha256.Sum256([]byte(*password))
+	var sum = sha256.Sum256([]byte(resolvedPassword))
 	passwordSha256 = sum[:]
 
 	logrus.Infoln("[Server]", util.BuildInfo())
@@ -189,7 +216,7 @@ func runServer(args []string) {
 					"[Server] inbound connection dropped (pressure)",
 					fmt.Errorf("active=%d soft_limit=%d hard_limit=%d %s", activeNow, softLimit, connLimit, pressureReason),
 				)
-				fallback(ctx, c)
+				closeInboundConnection(c)
 				continue
 			}
 		}
@@ -219,7 +246,7 @@ func runServer(args []string) {
 		if !acquired {
 			pressureCtl.onPressureDrop()
 			dropWarnLogger.log("[Server] inbound connection dropped", fmt.Errorf("active=%d limit=%d %s", len(connSlots), connLimit, serverFDUsageSummary()))
-			fallback(ctx, c)
+			closeInboundConnection(c)
 			continue
 		}
 		go func(conn net.Conn) {

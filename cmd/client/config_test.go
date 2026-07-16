@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -210,6 +211,109 @@ func TestTLSKeyLogRequiresExplicitDebugOptIn(t *testing.T) {
 	}
 	if got := tlsKeyLogPathFromEnv(getenv); got != "/tmp/sslkeys.log" {
 		t.Fatalf("explicit key-log opt-in not honored, got %q", got)
+	}
+}
+
+func TestNonLoopbackControlRequiresWebAuthentication(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.Control = "0.0.0.0:18990"
+	if err := normalizeAndValidateConfig(cfg); err == nil {
+		t.Fatalf("expected unauthenticated non-loopback control address to be rejected")
+	}
+
+	cfg = testClientConfig()
+	cfg.Control = "0.0.0.0:18990"
+	cfg.WebUsername = "admin"
+	cfg.WebPassword = "strong-password"
+	if err := normalizeAndValidateConfig(cfg); err != nil {
+		t.Fatalf("authenticated non-loopback control address rejected: %v", err)
+	}
+}
+
+func TestOpenTLSKeyLogUsesOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permissions are not enforced on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "sslkeys.log")
+	if err := os.WriteFile(path, []byte("existing\n"), 0644); err != nil {
+		t.Fatalf("seed key log failed: %v", err)
+	}
+	f, err := openTLSKeyLog(path)
+	if err != nil {
+		t.Fatalf("openTLSKeyLog failed: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close key log failed: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat key log failed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("key log permissions=%#o want=0600", got)
+	}
+}
+
+func TestSaveClientConfigUsesOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permissions are not enforced on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := saveClientConfig(path, testClientConfig()); err != nil {
+		t.Fatalf("saveClientConfig failed: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat config failed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("config permissions=%#o want=0600", got)
+	}
+
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatalf("chmod config failed: %v", err)
+	}
+	if err := saveClientConfig(path, testClientConfig()); err != nil {
+		t.Fatalf("overwrite config failed: %v", err)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat overwritten config failed: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0600 {
+		t.Fatalf("overwritten config permissions=%#o want=0600", got)
+	}
+}
+
+func TestClientConfigBackupUsesOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file permissions are not enforced on Windows")
+	}
+
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := saveClientConfig(path, testClientConfig()); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	backupPath, err := backupCurrentConfig(path)
+	if err != nil {
+		t.Fatalf("backupCurrentConfig failed: %v", err)
+	}
+
+	dirInfo, err := os.Stat(configBackupDir(path))
+	if err != nil {
+		t.Fatalf("stat backup dir failed: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0700 {
+		t.Fatalf("backup dir permissions=%#o want=0700", got)
+	}
+	backupInfo, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("stat backup failed: %v", err)
+	}
+	if got := backupInfo.Mode().Perm(); got != 0600 {
+		t.Fatalf("backup permissions=%#o want=0600", got)
 	}
 }
 

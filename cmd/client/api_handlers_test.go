@@ -62,6 +62,225 @@ func (m *testTunRouteManager) UpdateNode(server string) error      { return m.up
 func (m *testTunRouteManager) EnsureBypass(target string) error    { return nil }
 func (m *testTunRouteManager) Close() error                        { return nil }
 
+func TestHandleConfigRoutingHeadersAreWriteOnly(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	cfg.Routing = &clientRoutingConfig{
+		Enabled: true,
+		RuleProviders: map[string]clientRuleProvider{
+			"private": {
+				Type: "http",
+				URL:  "https://example.com/rules.txt",
+				Header: map[string][]string{
+					"Authorization": {"Bearer provider-secret"},
+				},
+			},
+		},
+		GeoIP: &clientRoutingGeoIPConfig{
+			Type: "http",
+			URL:  "https://example.com/geo.mmdb",
+		},
+	}
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, cfg, configPath)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	getResp := httptest.NewRecorder()
+	state.handleConfig(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	for _, secret := range []string{"provider-secret", "Authorization"} {
+		if strings.Contains(getResp.Body.String(), secret) {
+			t.Fatalf("config response leaked routing header %q: %s", secret, getResp.Body.String())
+		}
+	}
+
+	putResp := doJSONRequest(t, http.MethodPut, "/api/v1/config", map[string]any{
+		"routing": map[string]any{
+			"enabled": true,
+			"rule_providers": map[string]any{
+				"private": map[string]any{
+					"type": "http",
+					"url":  "https://example.com/new-rules.txt",
+				},
+			},
+			"geoip": map[string]any{
+				"type": "http",
+				"url":  "https://example.com/new-geo.mmdb",
+			},
+		},
+	}, state.handleConfig)
+	if putResp.Code != http.StatusOK {
+		t.Fatalf("unexpected PUT status: %d body=%s", putResp.Code, putResp.Body.String())
+	}
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if got := reloaded.Routing.RuleProviders["private"].Header["Authorization"]; len(got) != 1 || got[0] != "Bearer provider-secret" {
+		t.Fatalf("provider header was not preserved: %+v", reloaded.Routing.RuleProviders["private"].Header)
+	}
+
+	clearResp := doJSONRequest(t, http.MethodPut, "/api/v1/config", map[string]any{
+		"routing": map[string]any{
+			"enabled": true,
+			"rule_providers": map[string]any{
+				"private": map[string]any{
+					"type":   "http",
+					"url":    "https://example.com/new-rules.txt",
+					"header": map[string]any{},
+				},
+			},
+			"geoip": map[string]any{
+				"type": "http",
+				"url":  "https://example.com/new-geo.mmdb",
+			},
+		},
+	}, state.handleConfig)
+	if clearResp.Code != http.StatusOK {
+		t.Fatalf("unexpected clear status: %d body=%s", clearResp.Code, clearResp.Body.String())
+	}
+	reloaded, err = loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload cleared config failed: %v", err)
+	}
+	if header := reloaded.Routing.RuleProviders["private"].Header; len(header) != 0 {
+		t.Fatalf("explicit empty header did not clear old values: %+v", header)
+	}
+}
+
+func TestHandleNodesGetRedactsCredentialsAndPartialUpdatePreservesPassword(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	cfg.Nodes[0].URI = "anytls://change-me@example.com:8443/"
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, cfg, configPath)
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil)
+	getResp := httptest.NewRecorder()
+	state.handleNodes(getResp, getReq)
+	if getResp.Code != http.StatusOK {
+		t.Fatalf("unexpected GET status: %d body=%s", getResp.Code, getResp.Body.String())
+	}
+	var listed struct {
+		Nodes []map[string]any `json:"nodes"`
+	}
+	if err := json.Unmarshal(getResp.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode node list failed: %v", err)
+	}
+	if len(listed.Nodes) != 1 {
+		t.Fatalf("unexpected node count: %d", len(listed.Nodes))
+	}
+	if _, exists := listed.Nodes[0]["password"]; exists {
+		t.Fatalf("node list must omit password: %+v", listed.Nodes[0])
+	}
+	if _, exists := listed.Nodes[0]["uri"]; exists {
+		t.Fatalf("node list must omit credential-bearing URI: %+v", listed.Nodes[0])
+	}
+	if set, _ := listed.Nodes[0]["password_set"].(bool); !set {
+		t.Fatalf("node list missing password_set: %+v", listed.Nodes[0])
+	}
+
+	putResp := doJSONRequest(t, http.MethodPut, "/api/v1/nodes/node-1", map[string]any{
+		"sni": "updated.example.com",
+	}, state.handleNodeByName)
+	if putResp.Code != http.StatusOK {
+		t.Fatalf("unexpected PUT status: %d body=%s", putResp.Code, putResp.Body.String())
+	}
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if reloaded.Nodes[0].Password != "change-me" {
+		t.Fatalf("partial update replaced password: %q", reloaded.Nodes[0].Password)
+	}
+	if reloaded.Nodes[0].SNI != "updated.example.com" {
+		t.Fatalf("partial update did not update SNI: %q", reloaded.Nodes[0].SNI)
+	}
+}
+
+func TestHandleConfigGetRedactsSecrets(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	cfg.WebUsername = "admin"
+	cfg.WebPassword = "web-secret"
+	cfg.Nodes[0].URI = "anytls://change-me@example.com:8443/"
+	cfg.Subscriptions = []clientSubscription{{
+		ID:                "private-sub",
+		Name:              "Private",
+		URL:               "https://example.com/sub?token=subscription-secret",
+		Enabled:           true,
+		UpdateIntervalSec: 3600,
+	}}
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, cfg, configPath)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	resp := httptest.NewRecorder()
+	state.handleConfig(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	body := resp.Body.String()
+	for _, secret := range []string{"web-secret", "change-me", "subscription-secret"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("config response leaked secret %q: %s", secret, body)
+		}
+	}
+	var out struct {
+		Config map[string]any `json:"config"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode response failed: %v", err)
+	}
+	if _, exists := out.Config["web_password"]; exists {
+		t.Fatalf("config response must omit web_password field: %+v", out.Config)
+	}
+	if set, _ := out.Config["web_password_set"].(bool); !set {
+		t.Fatalf("missing web_password_set indicator: %+v", out.Config)
+	}
+}
+
+func TestHandleConfigPutEmptyWebPasswordPreservesSecretAndRedactsResponse(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client.json")
+	cfg := testClientConfig()
+	cfg.WebUsername = "admin"
+	cfg.WebPassword = "existing-secret"
+	if err := saveClientConfig(configPath, cfg); err != nil {
+		t.Fatalf("save initial config failed: %v", err)
+	}
+	state := newTestAPIState(t, cfg, configPath)
+
+	resp := doJSONRequest(t, http.MethodPut, "/api/v1/config", map[string]any{
+		"web_username": "admin",
+		"web_password": "",
+	}, state.handleConfig)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "existing-secret") {
+		t.Fatalf("PUT response leaked existing password: %s", resp.Body.String())
+	}
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload config failed: %v", err)
+	}
+	if reloaded.WebPassword != "existing-secret" {
+		t.Fatalf("empty password update replaced existing secret: %q", reloaded.WebPassword)
+	}
+}
+
 func TestHandleConfigPutSwitchAndPersist(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "client.json")
@@ -570,7 +789,7 @@ func TestHandleImportNodeAndList(t *testing.T) {
 		t.Fatalf("unexpected status: %d body=%s", resp.Code, resp.Body.String())
 	}
 	var out struct {
-		Nodes []clientNodeConfig `json:"nodes"`
+		Nodes []clientNodeAPIView `json:"nodes"`
 	}
 	if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode response failed: %v", err)
@@ -578,7 +797,7 @@ func TestHandleImportNodeAndList(t *testing.T) {
 	if len(out.Nodes) != 1 {
 		t.Fatalf("expected template node to be replaced, got %d nodes", len(out.Nodes))
 	}
-	var imported *clientNodeConfig
+	var imported *clientNodeAPIView
 	for i := range out.Nodes {
 		if out.Nodes[i].Name == "node-imported" {
 			imported = &out.Nodes[i]
@@ -588,8 +807,15 @@ func TestHandleImportNodeAndList(t *testing.T) {
 	if imported == nil {
 		t.Fatalf("imported node not found in response")
 	}
-	if imported.Password != "pass@word" {
-		t.Fatalf("expected decoded password, got %q", imported.Password)
+	if !imported.PasswordSet {
+		t.Fatalf("expected imported node password_set=true")
+	}
+	reloaded, err := loadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("reload imported config failed: %v", err)
+	}
+	if len(reloaded.Nodes) != 1 || reloaded.Nodes[0].Password != "pass@word" {
+		t.Fatalf("expected decoded password in persisted config, got %+v", reloaded.Nodes)
 	}
 }
 

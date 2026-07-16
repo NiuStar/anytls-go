@@ -547,7 +547,7 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 
 	path := tlsKeyLogPathFromEnv(os.Getenv)
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		f, err := openTLSKeyLog(path)
 		if err == nil {
 			tlsConfig.KeyLogWriter = f
 		}
@@ -661,6 +661,18 @@ func buildClientFromNode(ctx context.Context, node clientNodeConfig, minIdleSess
 		}
 		return tlsConn, nil
 	}, minIdleSession, node.EgressIP, node.EgressRule, node.Password, label), nil
+}
+
+func openTLSKeyLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
 }
 
 func tlsKeyLogPathFromEnv(getenv func(string) string) string {

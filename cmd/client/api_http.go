@@ -95,6 +95,12 @@ type apiState struct {
 	authPassword           string
 }
 
+const apiMaxRequestBodyBytes = 8 << 20
+const apiReadHeaderTimeout = 5 * time.Second
+const apiReadTimeout = 15 * time.Second
+const apiWriteTimeout = 30 * time.Second
+const apiIdleTimeout = 60 * time.Second
+
 const loopRepairCooldown = 8 * time.Second
 const loopRepairBlockedFor = 45 * time.Second
 const loopRepairGlobalCooldown = 12 * time.Second
@@ -582,8 +588,13 @@ func startHTTPAPIServer(addr string, state *apiState) error {
 	mux.HandleFunc("/", state.handleRoot)
 
 	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           apiRequestGuard(mux),
+		ReadHeaderTimeout: apiReadHeaderTimeout,
+		ReadTimeout:       apiReadTimeout,
+		WriteTimeout:      apiWriteTimeout,
+		IdleTimeout:       apiIdleTimeout,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	listener, err := net.Listen("tcp", addr)
@@ -656,6 +667,136 @@ func (s *apiState) handleRoot(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/ui/", http.StatusFound)
 }
 
+type clientNodeAPIView struct {
+	Name          string   `json:"name"`
+	Server        string   `json:"server"`
+	PasswordSet   bool     `json:"password_set"`
+	SNI           string   `json:"sni,omitempty"`
+	EgressIP      string   `json:"egress_ip,omitempty"`
+	EgressRule    string   `json:"egress_rule,omitempty"`
+	AllowInsecure *bool    `json:"allow_insecure,omitempty"`
+	CACertPath    string   `json:"ca_cert_path,omitempty"`
+	CertSHA256    string   `json:"cert_sha256,omitempty"`
+	Groups        []string `json:"groups,omitempty"`
+	SourceID      string   `json:"source_id,omitempty"`
+}
+
+func clientNodeViews(nodes []clientNodeConfig) []clientNodeAPIView {
+	views := make([]clientNodeAPIView, 0, len(nodes))
+	for _, node := range nodes {
+		views = append(views, clientNodeAPIView{
+			Name:          node.Name,
+			Server:        node.Server,
+			PasswordSet:   node.Password != "",
+			SNI:           node.SNI,
+			EgressIP:      node.EgressIP,
+			EgressRule:    node.EgressRule,
+			AllowInsecure: cloneBoolPtr(node.AllowInsecure),
+			CACertPath:    node.CACertPath,
+			CertSHA256:    node.CertSHA256,
+			Groups:        append([]string(nil), node.Groups...),
+			SourceID:      node.SourceID,
+		})
+	}
+	return views
+}
+
+type clientSubscriptionAPIView struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	URLSet            bool     `json:"url_set"`
+	Enabled           bool     `json:"enabled"`
+	UpdateIntervalSec int      `json:"update_interval_sec,omitempty"`
+	NodePrefix        string   `json:"node_prefix,omitempty"`
+	Groups            []string `json:"groups,omitempty"`
+}
+
+func clientSubscriptionViews(subscriptions []clientSubscription) []clientSubscriptionAPIView {
+	views := make([]clientSubscriptionAPIView, 0, len(subscriptions))
+	for _, sub := range subscriptions {
+		views = append(views, clientSubscriptionAPIView{
+			ID:                sub.ID,
+			Name:              sub.Name,
+			URLSet:            strings.TrimSpace(sub.URL) != "",
+			Enabled:           sub.Enabled,
+			UpdateIntervalSec: sub.UpdateIntervalSec,
+			NodePrefix:        sub.NodePrefix,
+			Groups:            append([]string(nil), sub.Groups...),
+		})
+	}
+	return views
+}
+
+func routingConfigView(cfg *clientRoutingConfig) *clientRoutingConfig {
+	view := cloneRoutingConfig(cfg)
+	if view == nil {
+		return nil
+	}
+	for name, provider := range view.RuleProviders {
+		provider.Header = nil
+		view.RuleProviders[name] = provider
+	}
+	if view.GeoIP != nil {
+		view.GeoIP.Header = nil
+	}
+	return view
+}
+
+func preserveOmittedRoutingHeaders(next, previous *clientRoutingConfig) {
+	if next == nil || previous == nil {
+		return
+	}
+	for name, provider := range next.RuleProviders {
+		if provider.Header != nil {
+			continue
+		}
+		old, ok := previous.RuleProviders[name]
+		if !ok || len(old.Header) == 0 {
+			continue
+		}
+		provider.Header = make(map[string][]string, len(old.Header))
+		for key, values := range old.Header {
+			provider.Header[key] = append([]string(nil), values...)
+		}
+		next.RuleProviders[name] = provider
+	}
+}
+
+type clientConfigAPIView struct {
+	Listen         string                      `json:"listen"`
+	MinIdleSession int                         `json:"min_idle_session"`
+	Control        string                      `json:"control"`
+	WebUsername    string                      `json:"web_username,omitempty"`
+	WebPasswordSet bool                        `json:"web_password_set"`
+	DefaultNode    string                      `json:"default_node"`
+	Nodes          []clientNodeAPIView         `json:"nodes"`
+	Subscriptions  []clientSubscriptionAPIView `json:"subscriptions,omitempty"`
+	Routing        *clientRoutingConfig        `json:"routing,omitempty"`
+	Tun            *clientTunConfig            `json:"tun,omitempty"`
+	MITM           *clientMITMConfig           `json:"mitm,omitempty"`
+	Failover       *clientFailoverConfig       `json:"failover,omitempty"`
+}
+
+func clientConfigView(cfg *clientProfileConfig) clientConfigAPIView {
+	if cfg == nil {
+		return clientConfigAPIView{}
+	}
+	return clientConfigAPIView{
+		Listen:         cfg.Listen,
+		MinIdleSession: cfg.MinIdleSession,
+		Control:        cfg.Control,
+		WebUsername:    cfg.WebUsername,
+		WebPasswordSet: cfg.WebPassword != "",
+		DefaultNode:    cfg.DefaultNode,
+		Nodes:          clientNodeViews(cfg.Nodes),
+		Subscriptions:  clientSubscriptionViews(cfg.Subscriptions),
+		Routing:        routingConfigView(cfg.Routing),
+		Tun:            cfg.Tun,
+		MITM:           cfg.MITM,
+		Failover:       cfg.Failover,
+	}
+}
+
 func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -664,7 +805,7 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"config_path": s.configPath,
 			"current":     s.manager.CurrentNodeName(),
-			"config":      s.cfg,
+			"config":      clientConfigView(s.cfg),
 		})
 	case http.MethodPut:
 		var req struct {
@@ -724,7 +865,10 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 			s.cfg.WebUsername = strings.TrimSpace(*req.WebUsername)
 		}
 		if req.WebPassword != nil {
-			s.cfg.WebPassword = strings.TrimSpace(*req.WebPassword)
+			next := strings.TrimSpace(*req.WebPassword)
+			if next != "" {
+				s.cfg.WebPassword = next
+			}
 		}
 		if req.MinIdleSession != nil {
 			if *req.MinIdleSession <= 0 {
@@ -752,6 +896,7 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.Routing != nil {
 			nextRouting := cloneRoutingConfig(req.Routing)
+			preserveOmittedRoutingHeaders(nextRouting, s.cfg.Routing)
 			if nextRouting != nil {
 				if err := normalizeRoutingConfig(nextRouting); err != nil {
 					writeError(w, http.StatusBadRequest, err.Error())
@@ -868,7 +1013,7 @@ func (s *apiState) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"saved":            true,
 			"restart_required": restartRequired,
 			"current":          s.manager.CurrentNodeName(),
-			"config":           s.cfg,
+			"config":           clientConfigView(s.cfg),
 		}
 		if routingGroupSynced != "" {
 			resp["routing_group_synced"] = routingGroupSynced
@@ -5736,12 +5881,6 @@ func authClientKey(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
-	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		items := strings.Split(xff, ",")
-		if len(items) > 0 {
-			return strings.TrimSpace(items[0])
-		}
-	}
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {
 		return host
@@ -5953,7 +6092,7 @@ func (s *apiState) handleNodes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"current": s.manager.CurrentNodeName(),
 			"default": s.cfg.DefaultNode,
-			"nodes":   s.cfg.Nodes,
+			"nodes":   clientNodeViews(s.cfg.Nodes),
 		})
 	case http.MethodPost:
 		var req clientNodeConfig
@@ -7790,12 +7929,62 @@ func (s *apiState) reconcileMITMLocked(next *clientMITMConfig) (bool, error) {
 }
 
 func decodeJSONBody(r *http.Request, out any) error {
-	decoder := json.NewDecoder(r.Body)
+	if r == nil || r.Body == nil {
+		return io.EOF
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, apiMaxRequestBodyBytes+1))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(out); err != nil {
 		return err
 	}
+	if decoder.InputOffset() > apiMaxRequestBodyBytes {
+		return fmt.Errorf("request body exceeds %d bytes", apiMaxRequestBodyBytes)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain a single JSON value")
+		}
+		return err
+	}
 	return nil
+}
+
+func apiRequestGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if isMutationMethod(r.Method) && isCrossSiteRequest(r) {
+				writeError(w, http.StatusForbidden, "cross-site request rejected")
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, apiMaxRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isMutationMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
+}
+
+func isCrossSiteRequest(r *http.Request) bool {
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	u, err := neturl.Parse(origin)
+	if err != nil || u.Host == "" {
+		return true
+	}
+	return !strings.EqualFold(u.Host, r.Host)
 }
 
 func writeJSON(w http.ResponseWriter, code int, data any) {

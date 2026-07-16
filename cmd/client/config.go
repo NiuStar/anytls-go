@@ -180,7 +180,23 @@ func saveClientConfig(path string, cfg *clientProfileConfig) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	return os.WriteFile(path, raw, 0644)
+	return writeOwnerOnlyFile(path, raw)
+}
+
+func writeOwnerOnlyFile(path string, raw []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if err := f.Chmod(0600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func normalizeAndValidateConfig(cfg *clientProfileConfig) error {
@@ -197,8 +213,12 @@ func normalizeAndValidateConfig(cfg *clientProfileConfig) error {
 	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
 		return fmt.Errorf("invalid listen address %q: %w", cfg.Listen, err)
 	}
-	if _, _, err := net.SplitHostPort(cfg.Control); err != nil {
+	controlHost, _, err := net.SplitHostPort(cfg.Control)
+	if err != nil {
 		return fmt.Errorf("invalid control address %q: %w", cfg.Control, err)
+	}
+	if !isLoopbackControlHost(controlHost) && (cfg.WebUsername == "" || cfg.WebPassword == "") {
+		return fmt.Errorf("web_username and web_password are required for non-loopback control address %q", cfg.Control)
 	}
 	if len(cfg.Nodes) == 0 {
 		return fmt.Errorf("no nodes in config")
@@ -258,6 +278,15 @@ func normalizeAndValidateConfig(cfg *clientProfileConfig) error {
 		return fmt.Errorf("default_node %q not found", cfg.DefaultNode)
 	}
 	return nil
+}
+
+func isLoopbackControlHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func normalizeRoutingConfig(cfg *clientRoutingConfig) error {
@@ -1108,14 +1137,21 @@ func backupCurrentConfig(path string) (string, error) {
 	defer src.Close()
 
 	backupDir := configBackupDir(path)
-	if err := os.MkdirAll(backupDir, 0755); err != nil {
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(backupDir, 0700); err != nil {
 		return "", err
 	}
 	name := fmt.Sprintf("%s.%s.bak", filepath.Base(path), time.Now().Format("20060102-150405.000000000"))
 	backupPath := filepath.Join(backupDir, name)
 
-	dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	dst, err := os.OpenFile(backupPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
+		return "", err
+	}
+	if err := dst.Chmod(0600); err != nil {
+		_ = dst.Close()
 		return "", err
 	}
 	if _, err := io.Copy(dst, src); err != nil {

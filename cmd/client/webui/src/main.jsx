@@ -1843,7 +1843,7 @@ function App() {
           listen: data.config.listen,
           control: data.config.control,
           web_username: data.config.web_username || "",
-          web_password: data.config.web_password || "",
+          web_password: "",
           min_idle_session: data.config.min_idle_session,
           tun_enabled: !!data.config.tun?.enabled,
           tun_name: data.config.tun?.name || "anytls0",
@@ -2143,11 +2143,12 @@ function App() {
         message.error("当前配置缺少可用节点标识，请先保证至少存在一个节点并刷新配置");
         return;
       }
+      const nextWebPassword = String(values.web_password || "").trim();
       const payload = {
         listen: values.listen,
         control: values.control,
         web_username: values.web_username || "",
-        web_password: values.web_password || "",
+        ...(nextWebPassword ? {web_password: nextWebPassword} : {}),
         min_idle_session: values.min_idle_session,
         default_node: keepDefaultNode,
         tun: {
@@ -3430,7 +3431,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     setEditNodeName(node.name);
     editForm.setFieldsValue({
       server: node.server,
-      password: node.password,
+      password: "",
       sni: node.sni || "",
       egress_ip: node.egress_ip || "",
       egress_rule: node.egress_rule || "",
@@ -3446,9 +3447,10 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     try {
       const allowInsecureMode = normalizeNodeAllowInsecureMode(values.allow_insecure_mode, "default");
       const allowInsecureValue = nodeAllowInsecureValueFromMode(allowInsecureMode);
+      const nextNodePassword = String(values.password || "").trim();
       const payload = {
         server: values.server || "",
-        password: values.password || "",
+        ...(nextNodePassword ? {password: nextNodePassword} : {}),
         sni: values.sni || "",
         egress_ip: values.egress_ip || "",
         egress_rule: values.egress_rule || "",
@@ -4514,7 +4516,7 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     subscriptionForm.setFieldsValue({
       id: item.id,
       name: item.name,
-      url: item.url,
+      url: "",
       enabled: !!item.enabled,
       update_interval_sec: item.update_interval_sec || 3600,
       node_prefix: item.node_prefix || "",
@@ -4537,16 +4539,19 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
     setSubscriptionSaving(true);
     try {
       if (editingSubscriptionID) {
+        const updatePayload = {
+          name: payload.name,
+          enabled: payload.enabled,
+          update_interval_sec: payload.update_interval_sec,
+          node_prefix: payload.node_prefix,
+          groups: payload.groups,
+        };
+        if (payload.url) {
+          updatePayload.url = payload.url;
+        }
         await api(`/api/v1/subscriptions/${encodeURIComponent(editingSubscriptionID)}`, {
           method: "PUT",
-          body: JSON.stringify({
-            name: payload.name,
-            url: payload.url,
-            enabled: payload.enabled,
-            update_interval_sec: payload.update_interval_sec,
-            node_prefix: payload.node_prefix,
-            groups: payload.groups,
-          })
+          body: JSON.stringify(updatePayload)
         });
       } else {
         await api("/api/v1/subscriptions", {
@@ -5005,22 +5010,10 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
   const subscriptionColumns = [
     {title: "名称", dataIndex: "name", width: 110, ellipsis: true},
     {
-      title: "URL",
-      dataIndex: "url",
-      width: 420,
-      ellipsis: true,
-      render: (v) => {
-        const text = String(v || "");
-        return (
-          <Typography.Text
-            copyable={text ? {text} : false}
-            ellipsis={{tooltip: text || "-"}}
-            style={{display: "inline-block", maxWidth: "100%"}}
-          >
-            {text || "-"}
-          </Typography.Text>
-        );
-      }
+      title: "订阅地址",
+      dataIndex: "url_set",
+      width: 100,
+      render: (set) => set ? <Tag color="green">已配置</Tag> : <Tag color="red">未配置</Tag>
     },
     {title: "状态", dataIndex: "enabled", width: 64, render: (v) => v ? <Tag color="blue">启用</Tag> : <Tag>停用</Tag>},
     {
@@ -6827,7 +6820,11 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
               <Input style={{width: 180}} />
             </Form.Item>
             <Form.Item label="Web 密码" name="web_password">
-              <Input.Password style={{width: 180}} />
+              <Input.Password
+                style={{width: 180}}
+                placeholder={config?.web_password_set ? "已设置，留空保持不变" : "输入新密码"}
+                autoComplete="new-password"
+              />
             </Form.Item>
             <Form.Item label="最小空闲会话" name="min_idle_session" rules={[{required: true}]}>
               <InputNumber style={{width: 140}} min={1} />
@@ -7346,8 +7343,15 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
           <Form.Item label="订阅名称" name="name">
             <Input placeholder="香港节点订阅" />
           </Form.Item>
-          <Form.Item label="订阅 URL" name="url" rules={[{required: true, message: "请输入订阅链接"}]}>
-            <Input placeholder="https://example.com/anytls-sub.txt" />
+          <Form.Item
+            label="订阅 URL"
+            name="url"
+            rules={editingSubscriptionID ? [] : [{required: true, message: "请输入订阅链接"}]}
+          >
+            <Input
+              placeholder={editingSubscriptionID ? "已配置，留空保持不变" : "https://example.com/anytls-sub.txt"}
+              autoComplete="off"
+            />
           </Form.Item>
           <Form.Item label="节点前缀" name="node_prefix">
             <Input placeholder="hk-sub" />
@@ -7373,7 +7377,12 @@ Import-Certificate -FilePath "$env:TEMP\\anytls-mitm-ca.crt" -CertStoreLocation 
       <Modal title={`编辑节点: ${editNodeName}`} open={editVisible} onCancel={() => setEditVisible(false)} onOk={saveNodeEdit}>
         <Form layout="vertical" form={editForm}>
           <Form.Item label="服务器" name="server"><Input /></Form.Item>
-          <Form.Item label="密码" name="password"><Input /></Form.Item>
+          <Form.Item label="密码" name="password">
+            <Input.Password
+              placeholder={nodes.find((item) => item.name === editNodeName)?.password_set ? "已设置，留空保持不变" : "输入新密码"}
+              autoComplete="new-password"
+            />
+          </Form.Item>
           <Form.Item label="SNI" name="sni"><Input /></Form.Item>
           <Form.Item label="分组" name="groups">
             <Select

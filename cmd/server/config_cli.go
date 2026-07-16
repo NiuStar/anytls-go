@@ -77,6 +77,7 @@ func runServerConfigEdit(args []string) error {
 	configPath := fs.String("config", defaultServerConfigPath(), "server env config path")
 	listen := fs.String("listen", "", "listen address host:port")
 	password := fs.String("password", "", "password")
+	passwordFile := fs.String("password-file", "", "read password from a file")
 	certDir := fs.String("cert-dir", "", "TLS cert dir, requires server.crt and server.key")
 	certFile := fs.String("cert-file", "", "TLS cert file path")
 	keyFile := fs.String("key-file", "", "TLS key file path")
@@ -101,8 +102,12 @@ func runServerConfigEdit(args []string) error {
 	if strings.TrimSpace(*listen) != "" {
 		cfg.Listen = strings.TrimSpace(*listen)
 	}
-	if strings.TrimSpace(*password) != "" {
-		cfg.Password = strings.TrimSpace(*password)
+	resolvedPassword, err := resolveServerPassword(*password, *passwordFile)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(resolvedPassword) != "" {
+		cfg.Password = strings.TrimSpace(resolvedPassword)
 	}
 	if strings.TrimSpace(*certDir) != "" {
 		cfg.CertDir = strings.TrimSpace(*certDir)
@@ -141,7 +146,7 @@ func runServerConfigEdit(args []string) error {
 			return promptErr
 		}
 
-		if strings.TrimSpace(*password) == "" {
+		if strings.TrimSpace(*password) == "" && strings.TrimSpace(*passwordFile) == "" {
 			if cfg.Password != "" {
 				needChange, err := promptYesNo(reader, "是否修改密码？", false)
 				if err != nil {
