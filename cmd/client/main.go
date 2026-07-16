@@ -410,7 +410,16 @@ func runWithConfig(ctx context.Context, configPath string, listen *string, minId
 	runClientListener(ctx, *listen, newRoutingInbound(manager, routingEngine, mitm))
 }
 
+func singleNodeCertSHA256FromURI(raw string) string {
+	serverURL, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !strings.EqualFold(serverURL.Scheme, "anytls") {
+		return ""
+	}
+	return firstQueryValue(serverURL.Query(), "cert-sha256", "cert_sha256", "certificate-sha256", "certificate_sha256", "fingerprint", "fingerprint-sha256", "fingerprint_sha256")
+}
+
 func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, egressIP, egressRule *string, allowInsecure *bool, caCertPath *string, minIdleSession *int) {
+	certSHA256 := singleNodeCertSHA256FromURI(*serverAddr)
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
 		if serverURL.Scheme == "anytls" {
 			*serverAddr = serverURL.Host
@@ -464,6 +473,7 @@ func runWithSingleNode(ctx context.Context, listen, serverAddr, sni, password, e
 		EgressRule:    *egressRule,
 		AllowInsecure: cloneBoolPtr(allowInsecure),
 		CACertPath:    strings.TrimSpace(*caCertPath),
+		CertSHA256:    strings.TrimSpace(certSHA256),
 	}, *minIdleSession)
 	if err != nil {
 		logrus.Fatalln(err)

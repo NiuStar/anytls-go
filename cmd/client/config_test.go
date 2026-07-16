@@ -33,6 +33,14 @@ func testClientConfig() *clientProfileConfig {
 	}
 }
 
+func TestSingleNodeCertSHA256FromURI(t *testing.T) {
+	const pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	got := singleNodeCertSHA256FromURI("anytls://secret@example.com:443?sni=example.com&insecure=1&cert-sha256=" + pin)
+	if got != pin {
+		t.Fatalf("single-node URI certificate pin was not propagated: got %q want %q", got, pin)
+	}
+}
+
 func TestParseAnyTLSURIDecodePassword(t *testing.T) {
 	server, password, sni, egressIP, egressRule, err := parseAnyTLSURI("anytls://Wangzai007..%40%40@23.141.52.18:20086/?sni=test.example&egress-ip=203.0.113.9&egress-rule=default=203.0.113.10")
 	if err != nil {
