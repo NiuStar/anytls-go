@@ -26,6 +26,7 @@ DIRECT_CERT_DIR=""
 DIRECT_EXPORT_ADDR=""
 DIRECT_PUBLIC_IP=""
 DIRECT_SUBSCRIPTION_LISTEN=""
+DIRECT_LISTEN_EXPLICIT=false
 SUBSCRIPTION_CONFIG="$CONFIG_DIR/subscription.json"
 
 fail() {
@@ -137,14 +138,14 @@ prompt_input() {
 	local default_value="${2:-}"
 	local input=""
 	if [[ -n "$default_value" ]]; then
-		read -r -p "$label [$default_value]: " input
+		read -r -p "$label [$default_value]: " input || return 1
 		if [[ -z "$input" ]]; then
 			echo "$default_value"
 		else
 			echo "$input"
 		fi
 	else
-		read -r -p "$label: " input
+		read -r -p "$label: " input || return 1
 		echo "$input"
 	fi
 }
@@ -153,16 +154,16 @@ usage() {
 	cat <<'EOF'
 Usage:
   anytls-install_server.sh
-  anytls-install_server.sh --install --password <password> [--listen 0.0.0.0:8443] [--addr YOUR_SERVER_IP:8443]
-  ANYTLS_PASSWORD=<password> anytls-install_server.sh --install [--addr YOUR_SERVER_IP:8443]
+  anytls-install_server.sh --install
+  anytls-install_server.sh --install --public-ip <ip> --port <port>
 
 Options:
-      --install          Non-interactive one-click install/update systemd service
+      --install          One-click install/update; terminal asks for public IP and port
       --listen <addr>    Server listen address, default 0.0.0.0:8443
       --port <port>      Shortcut for --listen 0.0.0.0:<port>
       --password <text>  AnyTLS password; if omitted in --install mode, a random one is generated
       --cert-dir <dir>   Use existing server.crt/server.key directory instead of auto-generated cert
-      --public-ip <ip>   Public numeric IP override; otherwise bounded HTTPS discovery
+      --public-ip <ip>   Advanced public numeric IP override (skips IP selection)
       --subscription-listen <addr> Dedicated HTTPS listener, default :443
       --addr <addr>      Legacy URI export address; does not set subscription identity
   -p, --proxy <url>      GitHub mirror prefix (e.g. https://ghfast.top/)
@@ -220,6 +221,7 @@ parse_args() {
 		--listen)
 			[[ $# -ge 2 ]] || fail "$1 requires a value"
 			DIRECT_LISTEN="$2"
+			DIRECT_LISTEN_EXPLICIT=true
 			shift 2
 			;;
 		--public-ip)
@@ -242,6 +244,7 @@ parse_args() {
 			;;
 		--listen=*)
 			DIRECT_LISTEN="${1#*=}"
+			DIRECT_LISTEN_EXPLICIT=true
 			shift
 			;;
 		--port)
@@ -426,71 +429,181 @@ format_host_port() {
 }
 
 is_public_ipv4() {
-	local ip="$1"
-	local a b c d
+	local ip="$1" a b c d part
+	[[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
 	IFS='.' read -r a b c d <<<"$ip"
-	[[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
-	((a <= 255 && b <= 255 && c <= 255 && d <= 255)) || return 1
-	((a == 10)) && return 1
-	((a == 127)) && return 1
-	((a == 0)) && return 1
-	((a == 169 && b == 254)) && return 1
-	((a == 172 && b >= 16 && b <= 31)) && return 1
-	((a == 192 && b == 168)) && return 1
-	((a == 100 && b >= 64 && b <= 127)) && return 1
-	((a == 198 && (b == 18 || b == 19))) && return 1
-	((a == 192 && b == 0 && c == 2)) && return 1
-	((a == 198 && b == 51 && c == 100)) && return 1
-	((a == 203 && b == 0 && c == 113)) && return 1
-	((a >= 224)) && return 1
+	for part in "$a" "$b" "$c" "$d"; do
+		[[ "$part" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((part <= 255)) || return 1
+	done
+	((a == 0 || a == 10 || a == 127 || a >= 224)) && return 1
+	((a == 169 && b == 254 || a == 172 && b >= 16 && b <= 31)) && return 1
+	((a == 192 && (b == 168 || b == 0 && (c == 0 || c == 2) || b == 88 && c == 99))) && return 1
+	((a == 100 && b >= 64 && b <= 127 || a == 198 && (b == 18 || b == 19))) && return 1
+	((a == 198 && b == 51 && c == 100 || a == 203 && b == 0 && c == 113)) && return 1
 	return 0
 }
 
-is_public_ip() {
-	local ip="${1,,}"
-	if [[ "$ip" == *:* ]]; then
-		[[ "$ip" == "::1" ]] && return 1
-		[[ "$ip" == fc* || "$ip" == fd* ]] && return 1
-		[[ "$ip" == fe8* || "$ip" == fe9* || "$ip" == fea* || "$ip" == feb* ]] && return 1
-		[[ "$ip" == ff* ]] && return 1
-		[[ "$ip" == 2001:db8* ]] && return 1
-		return 0
+canonical_ipv6() {
+	local ip="$1" left right group gap i start=-1 length=0 best=-1 best_length=0 out=""
+	local -a before=() after=() full=()
+	if [[ "$ip" == *::* ]]; then
+		left="${ip%%::*}"; right="${ip#*::}"
+		IFS=: read -r -a before <<<"$left"
+		IFS=: read -r -a after <<<"$right"
+		gap=$((8 - ${#before[@]} - ${#after[@]}))
+		((gap > 0)) || return 1
+		full=("${before[@]}")
+		for ((i=0; i<gap; i++)); do full+=(0); done
+		full+=("${after[@]}")
+	else
+		IFS=: read -r -a full <<<"$ip"
 	fi
-	is_public_ipv4 "$ip"
+	((${#full[@]} == 8)) || return 1
+	for ((i=0; i<=8; i++)); do
+		if ((i < 8)) && [[ "${full[i]}" == 0 ]]; then
+			((start >= 0)) || start=$i
+			length=$((length + 1))
+		else
+			if ((length >= 2 && length > best_length)); then best=$start; best_length=$length; fi
+			start=-1; length=0
+		fi
+	done
+	for ((i=0; i<8; i++)); do
+		if ((i == best)); then out+='::'; i=$((i + best_length - 1)); continue; fi
+		[[ -z "$out" || "$out" == *: ]] || out+=':'
+		out+="${full[i]}"
+	done
+	printf '%s\n' "$out"
+}
+
+is_public_ip() {
+	local ip="$1" expanded group first count=0
+	local -a groups=()
+	if [[ "$ip" != *:* ]]; then is_public_ipv4 "$ip"; return; fi
+	# Public subscription IPv6 is canonical, unmapped 2000::/3 only.
+	[[ "$ip" =~ ^[23][0-9a-f]{3}:[0-9a-f:]+$ && "$ip" != *:::* ]] || return 1
+	[[ "$ip" != *: || "$ip" == *:: ]] || return 1
+	if [[ "$ip" == *::* ]]; then
+		expanded="${ip/::/:}"
+		[[ "$expanded" != *::* ]] || return 1
+	else
+		[[ "$ip" != :* && "$ip" != *: ]] || return 1
+		expanded="$ip"
+	fi
+	IFS=: read -r -a groups <<<"$expanded"
+	for group in "${groups[@]}"; do
+		[[ -z "$group" ]] && continue
+		[[ "$group" =~ ^(0|[1-9a-f][0-9a-f]{0,3})$ ]] || return 1
+		count=$((count + 1))
+	done
+	if [[ "$ip" == *::* ]]; then ((count < 8)) || return 1; else ((count == 8)) || return 1; fi
+	[[ "$ip" == "$(canonical_ipv6 "$ip")" ]] || return 1
+	first="${ip%%:*}"
+	((16#$first >= 16#2000 && 16#$first <= 16#2001)) && {
+		[[ "$first" == 2000 ]] && return 0
+		group="${ip#*:}"; group="${group%%:*}"
+		[[ -z "$group" ]] && return 1
+		((16#$group < 16#200)) && return 1
+	}
+	[[ "$ip" == 2001:db8:* || "$ip" == 2002:* || "$ip" == 3fff:* ]] && return 1
+	return 0
 }
 
 collect_local_ips() {
-	local line=""
-	local ip=""
-	local -A seen=()
-	local -a ips=()
+	# Kernel address discovery is local and bounded when timeout is available.
+	local raw=""
+	command -v ip >/dev/null 2>&1 || return 0
+	if command -v timeout >/dev/null 2>&1; then
+		raw="$(timeout 5 ip -j address show up scope global 2>/dev/null || true)"
+	else
+		# Without a process deadline tool, rely on the bounded HTTPS candidates.
+		return 0
+	fi
+	printf '%s' "$raw" | grep -oE '"local"[[:space:]]*:[[:space:]]*"[0-9a-fA-F:.]+"' | cut -d '"' -f4 || true
+}
 
-	if command -v ip >/dev/null 2>&1; then
-		while IFS= read -r line; do
-			ip="${line%%/*}"
-			[[ -n "$ip" ]] || continue
-			[[ "$ip" == "127.0.0.1" ]] && continue
-			[[ "$ip" == "::1" ]] && continue
-			[[ "$ip" == fe80:* ]] && continue
-			is_public_ip "$ip" || continue
-			if [[ -z "${seen[$ip]+x}" ]]; then
-				seen["$ip"]=1
-				ips+=("$ip")
+public_ip_tool() {
+	local mode="$1" value="${2:-}" dir="" family endpoint ip pid
+	local -a pids=()
+	case "$mode" in
+	validate) is_public_ip "$value" ;;
+	public_ip|listen)
+		[[ -f "$value" ]] || return 0
+		# Read only these non-secret JSON scalars, never source persisted data.
+		grep -oE "\"$mode\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$value" | head -n1 | cut -d '"' -f4 || true
+		;;
+	candidates)
+		dir="$(mktemp -d)"
+		collect_local_ips >"$dir/local"
+		# Four verified HTTPS probes run in parallel: <=5s each, no redirects/proxy.
+		for family in 4 6; do
+			for endpoint in api.ipify.org ifconfig.co/ip; do
+				curl -"$family" -fsS --noproxy '*' --proto '=https' --connect-timeout 3 --max-time 5 --max-filesize 128 "https://$endpoint" >"$dir/$family-${endpoint%%/*}" 2>/dev/null &
+				pids+=("$!")
+			done
+		done
+		for pid in "${pids[@]}"; do wait "$pid" || true; done
+		{ for endpoint in "$dir/local" "$dir"/[46]-*; do cat "$endpoint"; printf '\n'; done; } | while IFS= read -r ip || [[ -n "$ip" ]]; do
+			if is_public_ip "$ip"; then printf '%s\n' "$ip"; fi
+		done | sort -u
+		rm -rf "$dir"
+		;;
+	esac
+}
+
+installer_interactive() { [[ -t 0 ]]; }
+
+valid_install_port() {
+	[[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (($1 <= 65535))
+}
+
+select_install_endpoint() {
+	local ask_port="$1" current="" ip="" choice="" port="" sub_listen="" sub_port="" default_choice=1 i
+	local -a ips=()
+	if [[ -z "$DIRECT_PUBLIC_IP" ]] && installer_interactive; then
+		current="$(public_ip_tool public_ip "$SUBSCRIPTION_CONFIG")"
+		if [[ -n "$current" ]] && public_ip_tool validate "$current"; then ips+=("$current"); fi
+		echo "正在查找公网 IP（HTTPS 探测最多约 5 秒）..." >&2
+		while IFS= read -r ip; do
+			[[ -n "$ip" && "$ip" != "$current" ]] && ips+=("$ip")
+		done < <(public_ip_tool candidates)
+		((${#ips[@]})) || default_choice=0
+		echo "选择客户端连接的公网 IP（出口探测不代表公网入站可达）:" >&2
+		for ((i=0; i<${#ips[@]}; i++)); do printf '  %s) %s\n' "$((i+1))" "${ips[i]}" >&2; done
+		echo "  0) 手动输入公网 IP" >&2
+		while true; do
+			choice="$(prompt_input "输入序号" "$default_choice")" || fail "IP selection cancelled"
+			if [[ "$choice" == 0 ]]; then
+				while true; do
+					ip="$(prompt_input "公网数字 IP" "")" || fail "IP input cancelled"
+					if public_ip_tool validate "$ip"; then DIRECT_PUBLIC_IP="$ip"; break; fi
+					echo "请输入有效的公网数字 IP，不能使用内网、保留地址或域名。" >&2
+				done
+				break
+			elif [[ "$choice" =~ ^[1-9][0-9]{0,3}$ ]] && ((choice <= ${#ips[@]})); then
+				DIRECT_PUBLIC_IP="${ips[choice-1]}"; break
 			fi
-		done < <(ip -o addr show up scope global | awk '{print $4}')
-	elif command -v hostname >/dev/null 2>&1; then
-		for ip in $(hostname -I 2>/dev/null || true); do
-			[[ -n "$ip" ]] || continue
-			[[ "$ip" == "127.0.0.1" ]] && continue
-			is_public_ip "$ip" || continue
-			if [[ -z "${seen[$ip]+x}" ]]; then
-				seen["$ip"]=1
-				ips+=("$ip")
-			fi
+			echo "请输入列表中的序号。" >&2
 		done
 	fi
-
-	printf '%s\n' "${ips[@]}"
+	if [[ -n "$DIRECT_PUBLIC_IP" ]]; then public_ip_tool validate "$DIRECT_PUBLIC_IP" || fail "invalid public numeric IP"; fi
+	sub_listen="$DIRECT_SUBSCRIPTION_LISTEN"
+	if [[ -z "$sub_listen" ]]; then sub_listen="$(public_ip_tool listen "$SUBSCRIPTION_CONFIG")"; fi
+	sub_port="$(port_from_listen "${sub_listen:-:443}")"
+	port="$(port_from_listen "$DIRECT_LISTEN")"
+	if [[ "$ask_port" == true ]] && installer_interactive; then
+		while true; do
+			port="$(prompt_input "AnyTLS 代理端口（订阅 HTTPS 独立使用 $sub_port）" "$port")" || fail "port input cancelled"
+			if valid_install_port "$port" && [[ "$port" != "$sub_port" ]]; then break; fi
+			echo "端口须为 1-65535 的十进制整数（无前导零），且不能与订阅 HTTPS 端口相同。" >&2
+		done
+		DIRECT_LISTEN="${DIRECT_LISTEN%:*}:$port"
+	fi
+	# A port shortcut/default may adapt to IPv6; never override an explicit bind.
+	if [[ ! -f "$CONFIG_FILE" && "$DIRECT_LISTEN_EXPLICIT" == false && "$DIRECT_LISTEN" == 0.0.0.0:* && "$DIRECT_PUBLIC_IP" == *:* ]]; then DIRECT_LISTEN="[::]:$port"; fi
+	valid_install_port "$port" || fail "port must be canonical decimal 1-65535"
+	[[ "$port" != "$sub_port" ]] || fail "AnyTLS and subscription HTTPS ports must differ; use --subscription-listen"
+	if [[ -n "$DIRECT_PUBLIC_IP" ]]; then DIRECT_EXPORT_ADDR="$(format_host_port "$DIRECT_PUBLIC_IP" "$port")"; fi
 }
 
 detect_arch() {
@@ -607,6 +720,14 @@ write_config() {
 	local cert_dir="$3"
 	local args=()
 
+	if [[ -f "$CONFIG_FILE" && -f "$PASSWORD_FILE" && -x "$INSTALL_BIN_PATH" ]]; then
+		# A repeated installation with unchanged fields must not rewrite config bytes.
+		if [[ "$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field listen)" == "$listen_addr" &&
+		      "$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field password)" == "$password" &&
+		      "$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field cert-dir)" == "$cert_dir" ]]; then
+			return
+		fi
+	fi
 	mkdir -p "$CONFIG_DIR"
 	chmod 0700 "$CONFIG_DIR"
 	umask 077
@@ -833,9 +954,14 @@ validate_direct_install_config() {
 install_action_direct() {
 	local subscription_args=()
 	local ready=false
-	echo "AnyTLS Server 非交互一键安装"
+	local ask_port=true
+	[[ -z "$DIRECT_LISTEN" && -z "$DIRECT_EXPORT_ADDR" ]] || ask_port=false
+	echo "AnyTLS Server 一键安装"
+	# Keep the ordinary path to IP + port only; --proxy/env remain available.
+	GITHUB_MIRROR_PROMPTED=true
 	download_latest_binary
 	validate_direct_install_config
+	select_install_endpoint "$ask_port"
 	write_config "$DIRECT_LISTEN" "$DIRECT_PASSWORD" "$DIRECT_CERT_DIR"
 	subscription_args=(config subscription --config "$CONFIG_FILE" --subscription-config "$SUBSCRIPTION_CONFIG")
 	if [[ -n "$DIRECT_PUBLIC_IP" ]]; then subscription_args+=(--public-ip "$DIRECT_PUBLIC_IP"); fi
@@ -859,33 +985,8 @@ install_action_direct() {
 }
 
 install_action() {
-	LISTEN_VALUE=""
-	PASSWORD_VALUE=""
-	CERT_DIR_VALUE=""
-
-	echo "AnyTLS Server 一键安装"
-	echo "GitHub 仓库: $REPO_DEFAULT"
-	echo
-
-	collect_install_or_modify_config "$DEFAULT_PORT" "" ""
-	download_latest_binary
-	write_config "$LISTEN_VALUE" "$PASSWORD_VALUE" "$CERT_DIR_VALUE"
-	write_start_script
-	write_systemd_service
-
-	systemctl daemon-reload
-	systemctl enable --now "$SERVICE_NAME"
-
-	echo
-	echo "安装完成并已启动: $SERVICE_NAME"
-	echo "监听地址: $LISTEN_VALUE"
-	if [[ -n "$CERT_DIR_VALUE" ]]; then
-		echo "证书目录: $CERT_DIR_VALUE (server.crt / server.key)"
-	else
-		echo "证书模式: 自动生成"
-	fi
-	echo
-	systemctl --no-pager --full status "$SERVICE_NAME" || true
+	# The menu and --install must provision the same private subscription.
+	install_action_direct
 }
 
 uninstall_action() {

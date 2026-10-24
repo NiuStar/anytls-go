@@ -9,19 +9,42 @@ On the intended Linux server, after publishing a binary containing this feature:
 
 ```sh
 sudo bash scripts/anytls-install_server.sh --install
-# NAT or multihoming override; a real public numeric address is required:
-sudo bash scripts/anytls-install_server.sh --install --public-ip YOUR_PUBLIC_IP
-# Optional dedicated HTTPS port:
+# Advanced unattended override: select a real public numeric IP and proxy port.
+sudo bash scripts/anytls-install_server.sh --install --public-ip <public-ip> --port 8443
+# Optional dedicated HTTPS port (independent of the proxy port):
 sudo bash scripts/anytls-install_server.sh --install --subscription-listen :9443
 ```
 
-The installer performs a bounded, verified HTTPS request to api.ipify.org only
-on first configuration if no override is provided. Failure requires an explicit
-`--public-ip`; wildcard listeners and private interface addresses are never
-advertised. Existing server password, TLS key/cert, listen and subscription token
-are preserved unless explicitly changed. Existing custom cert-file/key-file
-settings are forwarded. Dynamic per-SNI CA issuance is not supported for the
+In a terminal, choose the public IP by number and enter the AnyTLS proxy port
+(default 8443). The menu's Install action uses exactly the same flow. No password,
+`--addr`, domain or certificate file is required. The selected IP becomes the
+subscription node identity; IPv6 host/port output is automatically bracketed.
+The HTTPS subscription port defaults to 443 and must differ from the proxy port;
+an interactive conflicting port is re-prompted, explicit conflict fails before
+configuration writes.
+
+Candidates combine global interface addresses (`ip -j address`, when available)
+and four parallel, certificate-verified HTTPS probes: IPv4 and IPv6 requests to
+api.ipify.org and ifconfig.co/ip, each with a 5-second maximum and 3-second
+connection timeout, no proxy or redirects. Private, loopback, documentation,
+multicast, reserved and malformed addresses are excluded. No candidates means
+manual public-IP entry, not a private fallback. Egress detection does **not** prove
+inbound reachability; NAT/cloud firewall forwarding remains the operator's job.
+This installer uses Bash/system tools and adds no Python dependency.
+
+Existing public IP is the first/default choice; Enter retains it. Existing port,
+password, TLS key/cert and subscription token are preserved unless explicitly
+changed. Explicit `--public-ip` skips IP selection; `--port`/`--listen` skip the
+port prompt. With no terminal, no selection reads are performed: existing/default
+proxy port is retained and the server's existing bounded HTTPS discovery supplies
+an absent public IP on first setup, or fails. Existing custom cert-file/key-file
+settings are preserved. Dynamic per-SNI CA issuance is not supported for the
 subscription: use a persistent cert-dir or cert-file/key-file.
+
+Source-tree changes do not update immutable older Release script attachments;
+the Release/latest download command gains these prompts only after a matching
+new script is published. No release or production service operation is performed
+by the regression tests (`python3 -m unittest discover -s scripts -p 'test_*.py'`).
 
 The installer intentionally restarts its systemd service, checks active state,
 and verifies local HTTPS leaf identity and exact node content before printing a

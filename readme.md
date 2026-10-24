@@ -14,37 +14,27 @@
 
 ## 快速食用方法
 
-推荐使用“服务端一键生成证书 + 导出带证书指纹的 URI”的方式部署。该方式不要求域名或公网 CA 证书，也不需要把客户端设置成 `allow_insecure=true`；客户端会按 `cert-sha256` 校验服务端证书，避免中间人伪造服务端。
+推荐使用公网 IP 私有订阅：无需域名、公网 CA 或手填密码，客户端根据链接中固定的证书指纹建立信任。
 
 ### Linux 服务端一键部署脚本（推荐）
 
-Release 版本提供 `anytls-install_server.sh`，适合 Linux + systemd 服务器直接安装、升级、修改配置、导出客户端 URI：
+在目标 Linux + systemd 服务器的交互终端运行：
 
 ```bash
-curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh && chmod +x anytls-install_server.sh && sudo ./anytls-install_server.sh --install --password 'your-password' --port 55555 --addr YOUR_SERVER_IP:55555
+curl -fsSL https://raw.githubusercontent.com/NiuStar/anytls-go/main/scripts/anytls-install_server.sh -o anytls-install_server.sh && chmod +x anytls-install_server.sh && sudo ./anytls-install_server.sh --install
 ```
 
-脚本会自动完成：
+按序号选择公网 IP，再输入 AnyTLS 代理端口（默认 8443）。脚本自动组合 IP 和端口，IPv6 自动加方括号；不需要填写 `--addr` 或密码。探测失败可选择手动输入公网数字 IP，不会使用内网地址代替。
 
-- 下载最新 `anytls-server`；
-- 写入 `/etc/anytls/server.env`；
-- 创建并启动 `anytls-server.service`；
-- 默认启用自动证书；
-- 最后调用 `anytls-server config export` 输出带 `cert-sha256` 的客户端导入 URI。
+脚本会下载并校验最新程序，生成并持久保存随机密码、自签名证书与私有订阅令牌，安装／重启 systemd 服务，验证本机 HTTPS 证书和节点内容后显示私有订阅链接。已有密码、证书、订阅令牌及默认 IP／端口会保留，除非明确修改。链接是凭据，只交给预期客户端；将整条链接粘贴到支持固定证书指纹的客户端订阅入口。
 
-参数说明：`--port` / `--listen` 是服务端实际监听端口；`--addr` 是写入客户端 URI 的连接地址，应该填公网 IP 或域名。若只传 `--addr IP:端口` 且没有传 `--port/--listen`，脚本会自动用 `--addr` 中的端口作为监听端口。
+**订阅 HTTPS 默认独立使用 TCP 443**，不能与代理端口相同；请同时放行两者的主机／云防火墙端口。出口 IP 探测不证明公网入站可达，NAT 场景仍需端口映射。详情见[公网 IP 私有订阅](./docs/private_subscription.md)。
 
-也可以只运行交互菜单：
+高级无人值守覆盖：`--public-ip <公网数字IP> --port <代理端口>`；使用 `--subscription-listen :9443` 可单独改变订阅 HTTPS 端口。`--listen` 显式控制监听地址，`--addr` 仅保留旧版端口推导兼容，不是普通部署前提。无交互终端时不等待输入，保留已有配置／默认代理端口；首次公网 IP 由程序执行有界 HTTPS 自动发现，失败即退出。
 
-```bash
-sudo ./anytls-install_server.sh
-```
+也可以运行 `sudo ./anytls-install_server.sh`，菜单“安装”使用相同的 IP／端口选择与私有订阅流程；其他菜单项用于卸载、更新、修改配置与旧式 URI 导出。
 
-菜单支持安装、卸载、更新、修改配置和导出节点。导出的 URI 可直接用于客户端：
-
-```bash
-./anytls-client cli add 'anytls://your-password@YOUR_SERVER_IP:55555/?cert-sha256=<server-cert-sha256>' node-main
-```
+> 以上入口从 main 获取安装脚本，程序仍只下载并校验正式稳定 Release 的预编译二进制。旧 Release 内的脚本附件保持不变，`releases/latest/download/anytls-install_server.sh` 在新 Release 发布前仍是旧交互流程。
 
 ### 二进制手动配置服务端（无域名/无公网证书）
 
