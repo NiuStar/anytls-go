@@ -24,7 +24,11 @@ DIRECT_PASSWORD=fixture
 '''
             if tty:
                 prefix += 'installer_interactive() { return 0; }\n'
-            proc = subprocess.run(["bash", "-c", prefix + body, "test", str(source), d], input=data, text=True, capture_output=True, timeout=10)
+            proc = subprocess.run(["bash", "-c", prefix + body, "test", str(source), d], input=data.encode("utf-8"), capture_output=True, timeout=10)
+            # Old Bash may emit a partial multibyte read prompt on macOS.
+            # Preserve undecodable bytes visibly; never lose the child rc/assertions.
+            proc.stdout = proc.stdout.decode("utf-8", errors="backslashreplace")
+            proc.stderr = proc.stderr.decode("utf-8", errors="backslashreplace")
             if success:
                 self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
             else:
