@@ -136,6 +136,10 @@ jobs:
             ## ${{ env.TAG }}
 
             ### Changes
+            - Add a public-IP private HTTPS subscription with a separate token-authenticated listener; no domain, ACME, reverse proxy, or manual CA distribution is required.
+            - The Linux/systemd installer discovers a public IP (or accepts `--public-ip`), preserves existing credentials/TLS material, restarts the service, and verifies local certificate identity and exact node content before announcing a private link.
+            - Default ports: AnyTLS TCP 8443 and subscription HTTPS TCP 443; open both host/cloud firewall ports. Use `--subscription-listen :9443` to override HTTPS only.
+            - Import requires a compatible client: the private link pins leaf DER SHA256 before transmitting its token; node SPKI pins are distinct. This is pin-only trust, not PKIX plus pin. Keep links private and redistribute explicitly after certificate changes.
             - Harden the client control plane: write-only secrets, CSRF/origin checks, request-size limits, safer cookies, and HTTP timeouts.
             - Protect client credentials and configuration files with restrictive permissions and remove plaintext server passwords from systemd process arguments.
             - Harden server TLS/authentication handling, installer checksum verification, and systemd sandboxing.

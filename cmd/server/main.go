@@ -7,13 +7,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -83,6 +86,7 @@ func runServer(args []string) {
 	caCert := fs.String("ca-cert", "", "CA cert file path (used to issue server certs)")
 	caKey := fs.String("ca-key", "", "CA key file path (used to issue server certs)")
 	paddingScheme := fs.String("padding-scheme", "", "padding-scheme")
+	subscriptionPath := fs.String("subscription-config", "", "private subscription JSON config; enables dedicated HTTPS listener")
 	_ = fs.Parse(args)
 
 	resolvedPassword, err := resolveServerPassword(*password, *passwordFile)
@@ -132,11 +136,6 @@ func runServer(args []string) {
 		logrus.Fatalln("invalid tls config:", err)
 	}
 
-	listener, err := net.Listen("tcp", *listen)
-	if err != nil {
-		logrus.Fatalln("listen server tcp:", err)
-	}
-
 	autoCertDir := ""
 	if serverUsesAutoCert(serverEnvConfig{
 		CertDir:    strings.TrimSpace(*certDir),
@@ -153,7 +152,24 @@ func runServer(args []string) {
 	}
 	logrus.Infoln("[Server] TLS cert mode:", tlsMode)
 
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	var subscription *subscriptionConfig
+	if *subscriptionPath != "" {
+		loaded, err := loadSubscriptionConfig(*subscriptionPath)
+		if err != nil {
+			logrus.Fatalln(err)
+		}
+		subscription = &loaded
+	}
+	listener, subscriptionServer, err := startServerListeners(ctx, *listen, subscription, tlsConfig, resolvedPassword)
+	if err != nil {
+		logrus.Fatalln("start listeners failed:", err)
+	}
+	defer listener.Close()
+	if subscriptionServer != nil {
+		defer subscriptionServer.Close()
+	}
 	server := NewMyServer(tlsConfig)
 
 	connLimit := serverInboundConnLimit()
@@ -177,6 +193,9 @@ func runServer(args []string) {
 
 		c, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
 			acceptErrStreak++
 			backoff := time.Duration(acceptErrStreak) * 200 * time.Millisecond
 			if backoff > 2*time.Second {

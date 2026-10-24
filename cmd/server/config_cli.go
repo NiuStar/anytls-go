@@ -58,9 +58,13 @@ var stdinReader = bufio.NewReader(os.Stdin)
 
 func runServerConfigCLI(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: anytls-server config <edit|export> [options]")
+		return fmt.Errorf("usage: anytls-server config <edit|export|subscription|run|read-field> [options]")
 	}
 	switch args[0] {
+	case "run", "read-field":
+		return runServerConfigRuntime(args[0], args[1:])
+	case "subscription":
+		return runServerConfigSubscription(args[1:])
 	case "edit":
 		return runServerConfigEdit(args[1:])
 	case "export":

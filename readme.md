@@ -879,3 +879,28 @@ anytls-server config edit --config /etc/anytls/server.env \
   --listen 0.0.0.0:20086 --password 'your-password' \
   --ca-cert /etc/anytls/ca.crt --ca-key /etc/anytls/ca.key --yes
 ```
+
+## v0.0.28 发布目标：公网 IP 私有订阅一键安装
+
+本节对应待发布目标 **v0.0.28**，不表示该版本已上线。须等 v0.0.28
+正式发布并成为最新稳定版后，再在目标 Linux + systemd 服务器运行官方入口：
+
+```bash
+curl -fsSL https://github.com/NiuStar/anytls-go/releases/latest/download/anytls-install_server.sh -o anytls-install_server.sh && sudo bash ./anytls-install_server.sh --install
+```
+
+无需本机 Go 编译、域名、ACME、反向代理或手动分发 CA。安装器下载最新稳定版二进制；
+仅下载带版本号的脚本并不能固定二进制版本，旧版二进制也不会因换脚本而新增订阅能力。
+
+- 默认 AnyTLS TCP **8443**，独立订阅 HTTPS TCP **443**；请在主机和云防火墙放行两端口。
+- 自动公网 IP 发现失败、NAT 或多公网 IP 时，在命令末尾添加 `--public-ip YOUR_PUBLIC_IP`；
+  可用 `--subscription-listen :9443` 单独指定订阅端口。
+- 安装器保留已有密码、持久证书和订阅 token（除非明确修改），会重启 systemd 服务，
+  检查本地证书身份与节点内容后才输出私有导入链接；本地通过不等于公网可达。
+- 链接包含凭据，只通过可信渠道交给支持此 bootstrap pin 的客户端，不提交 Git 或公开日志。
+  链接中的 leaf DER SHA256 指纹与节点 SPKI SHA256 指纹不是同一字段；这是 pin-only
+  身份验证，不是 PKIX 加 pin。证书变化需重新可信分发链接，不能用关闭 TLS 校验替代。
+- 本次服务端更新不代表现有客户端管理脚本或所有通用订阅客户端支持该链接。
+
+详见 [私有订阅操作与信任边界](docs/private_subscription.md) 和
+[v0.0.28 发布说明](docs/releases/v0.0.28.md)。公开发布、附件校验与正式服务器安装分别验收。

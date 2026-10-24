@@ -24,6 +24,9 @@ DIRECT_LISTEN=""
 DIRECT_PASSWORD="${ANYTLS_PASSWORD:-}"
 DIRECT_CERT_DIR=""
 DIRECT_EXPORT_ADDR=""
+DIRECT_PUBLIC_IP=""
+DIRECT_SUBSCRIPTION_LISTEN=""
+SUBSCRIPTION_CONFIG="$CONFIG_DIR/subscription.json"
 
 fail() {
 	echo "Error: $*" >&2
@@ -159,7 +162,9 @@ Options:
       --port <port>      Shortcut for --listen 0.0.0.0:<port>
       --password <text>  AnyTLS password; if omitted in --install mode, a random one is generated
       --cert-dir <dir>   Use existing server.crt/server.key directory instead of auto-generated cert
-      --addr <addr>      Client-facing export address, for example 1.2.3.4:8443
+      --public-ip <ip>   Public numeric IP override; otherwise bounded HTTPS discovery
+      --subscription-listen <addr> Dedicated HTTPS listener, default :443
+      --addr <addr>      Legacy URI export address; does not set subscription identity
   -p, --proxy <url>      GitHub mirror prefix (e.g. https://ghfast.top/)
   -h, --help             Show this help
 EOF
@@ -216,6 +221,24 @@ parse_args() {
 			[[ $# -ge 2 ]] || fail "$1 requires a value"
 			DIRECT_LISTEN="$2"
 			shift 2
+			;;
+		--public-ip)
+			[[ $# -ge 2 ]] || fail "$1 requires a value"
+			DIRECT_PUBLIC_IP="$2"
+			shift 2
+			;;
+		--subscription-listen)
+			[[ $# -ge 2 ]] || fail "$1 requires a value"
+			DIRECT_SUBSCRIPTION_LISTEN="$2"
+			shift 2
+			;;
+		--public-ip=*)
+			DIRECT_PUBLIC_IP="${1#*=}"
+			shift
+			;;
+		--subscription-listen=*)
+			DIRECT_SUBSCRIPTION_LISTEN="${1#*=}"
+			shift
 			;;
 		--listen=*)
 			DIRECT_LISTEN="${1#*=}"
@@ -593,7 +616,7 @@ write_config() {
 		args=(config edit --config "$CONFIG_FILE" --listen "$listen_addr" --password-file "$PASSWORD_FILE" --yes)
 		if [[ -n "$cert_dir" ]]; then
 			args+=(--cert-dir "$cert_dir")
-		else
+		elif [[ ! -f "$CONFIG_FILE" ]]; then
 			args+=(--auto-cert)
 		fi
 		"$INSTALL_BIN_PATH" "${args[@]}"
@@ -614,12 +637,9 @@ write_start_script() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-source /etc/anytls/server.env
-PASSWORD_FILE=/etc/anytls/server.password
-
-args=(-l "$LISTEN" --password-file "$PASSWORD_FILE")
-if [[ -n "${CERT_DIR:-}" ]]; then
-	args+=(--cert-dir "$CERT_DIR")
+args=(config run --config /etc/anytls/server.env --password-file /etc/anytls/server.password)
+if [[ -f /etc/anytls/subscription.json ]]; then
+	args+=(--subscription-config /etc/anytls/subscription.json)
 fi
 
 exec /usr/local/bin/anytls-server "${args[@]}"
@@ -770,6 +790,19 @@ generate_random_password() {
 validate_direct_install_config() {
 	local port=""
 	local export_port=""
+	if [[ -f "$CONFIG_FILE" ]]; then
+		# Parse serialized data in Go; never evaluate credential bytes as shell.
+		[[ -x "$INSTALL_BIN_PATH" ]] || fail "existing config requires anytls-server parser"
+		if [[ -z "$DIRECT_LISTEN" ]]; then
+			DIRECT_LISTEN="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field listen)" || fail "cannot read existing listen"
+		fi
+		if [[ -z "$DIRECT_CERT_DIR" ]]; then
+			DIRECT_CERT_DIR="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field cert-dir)" || fail "cannot read existing cert directory"
+		fi
+		if [[ -z "$DIRECT_PASSWORD" ]]; then
+			DIRECT_PASSWORD="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field password)" || fail "cannot read existing password"
+		fi
+	fi
 	if [[ -z "$DIRECT_LISTEN" ]]; then
 		if [[ -n "$DIRECT_EXPORT_ADDR" ]]; then
 			export_port="$(port_from_listen "$DIRECT_EXPORT_ADDR")"
@@ -798,35 +831,31 @@ validate_direct_install_config() {
 }
 
 install_action_direct() {
-	local export_args=()
+	local subscription_args=()
+	local ready=false
 	echo "AnyTLS Server 非交互一键安装"
-	validate_direct_install_config
 	download_latest_binary
+	validate_direct_install_config
 	write_config "$DIRECT_LISTEN" "$DIRECT_PASSWORD" "$DIRECT_CERT_DIR"
+	subscription_args=(config subscription --config "$CONFIG_FILE" --subscription-config "$SUBSCRIPTION_CONFIG")
+	if [[ -n "$DIRECT_PUBLIC_IP" ]]; then subscription_args+=(--public-ip "$DIRECT_PUBLIC_IP"); fi
+	if [[ -n "$DIRECT_SUBSCRIPTION_LISTEN" ]]; then subscription_args+=(--subscription-listen "$DIRECT_SUBSCRIPTION_LISTEN"); fi
+	"$INSTALL_BIN_PATH" "${subscription_args[@]}"
 	write_start_script
 	write_systemd_service
 
 	systemctl daemon-reload
-	systemctl enable --now "$SERVICE_NAME"
-
-	echo
-	echo "安装完成并已启动: $SERVICE_NAME"
-	echo "监听地址: $DIRECT_LISTEN"
-	if [[ -n "$DIRECT_CERT_DIR" ]]; then
-		echo "证书目录: $DIRECT_CERT_DIR (server.crt / server.key)"
-	else
-		echo "证书模式: 自动生成 + cert-sha256 指纹校验"
-	fi
-	systemctl --no-pager --full status "$SERVICE_NAME" || true
-
-	echo
-	echo "================ 客户端导入信息 ================"
-	export_args=(config export --config "$CONFIG_FILE" --yes)
-	if [[ -n "$DIRECT_EXPORT_ADDR" ]]; then
-		export_args+=(--addr "$DIRECT_EXPORT_ADDR")
-	fi
-	"$INSTALL_BIN_PATH" "${export_args[@]}"
-	echo "=============================================="
+	systemctl enable "$SERVICE_NAME"
+	# Intentional operator-requested restart: enable --now does not reload.
+	systemctl restart "$SERVICE_NAME"
+	systemctl is-active --quiet "$SERVICE_NAME" || fail "service did not start"
+	for attempt in 1 2 3 4 5; do
+		if "$INSTALL_BIN_PATH" config subscription --config "$CONFIG_FILE" --subscription-config "$SUBSCRIPTION_CONFIG" --check-active; then ready=true; break; fi
+		sleep 1
+	done
+	[[ "$ready" == true ]] || fail "local subscription identity/content verification failed; no link announced"
+	echo "安装完成并已验证: $SERVICE_NAME"
+	echo "Private subscription link above is a credential; share only with the intended client."
 }
 
 install_action() {
@@ -899,17 +928,11 @@ modify_config_action() {
 	local current_cert_dir=""
 
 	[[ -f "$CONFIG_FILE" ]] || fail "未找到配置文件: $CONFIG_FILE，请先执行安装"
-	# shellcheck disable=SC1090
-	source "$CONFIG_FILE"
-
-	current_listen="${LISTEN:-0.0.0.0:${DEFAULT_PORT}}"
+	[[ -x "$INSTALL_BIN_PATH" ]] || fail "existing config requires anytls-server parser"
+	current_listen="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field listen)" || fail "cannot read existing listen"
 	current_port="$(port_from_listen "$current_listen")"
-	if [[ -f "$PASSWORD_FILE" ]]; then
-		current_password="$(<"$PASSWORD_FILE")"
-	else
-		current_password="${PASSWORD:-}"
-	fi
-	current_cert_dir="${CERT_DIR:-}"
+	current_password="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field password)" || fail "cannot read existing password"
+	current_cert_dir="$("$INSTALL_BIN_PATH" config read-field --config "$CONFIG_FILE" --password-file "$PASSWORD_FILE" --field cert-dir)" || fail "cannot read existing cert directory"
 
 	LISTEN_VALUE=""
 	PASSWORD_VALUE=""
