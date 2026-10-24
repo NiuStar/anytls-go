@@ -21,11 +21,22 @@ jobs:
         with:
           go-version: '1.26.8'
           cache: true
-      - name: Test
+      - name: Installer syntax
+        run: bash -n scripts/anytls-install_server.sh
+      - name: Installer regressions
+        shell: bash
+        run: |
+          python3 -B - <<'PY'
+          import unittest
+          result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('scripts', 'test_*.py'))
+          for test, trace in result.failures + result.errors:
+              message = (str(test) + '\n' + trace).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+              print('::error file=scripts/test_installer_ip_port.py::' + message, flush=True)
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+      - name: Go test and vet
         shell: bash
         run: |
           set -euo pipefail
-          bash -n scripts/anytls-install_server.sh
-          python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
           go test -count=1 ./...
           go vet ./...
