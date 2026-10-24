@@ -137,6 +137,9 @@ jobs:
             ## ${{ env.TAG }}
 
             ### Changes
+            - Interactive Linux installation now lists detected public IPv4/IPv6 addresses, asks for one proxy port, and composes the endpoint automatically; no manual `--addr` or password is required. Menu installation shares the same verified private-subscription path.
+            - Preserve explicit unattended overrides and existing credentials; validate canonical IPv6 and reject proxy/subscription port conflicts before configuration writes.
+            - Add executable Bash installer regressions on Linux/macOS, including older Bash and raw prompt-byte handling.
             - Add a public-IP private HTTPS subscription with a separate token-authenticated listener; no domain, ACME, reverse proxy, or manual CA distribution is required.
             - The Linux/systemd installer discovers a public IP (or accepts `--public-ip`), preserves existing credentials/TLS material, restarts the service, and verifies local certificate identity and exact node content before announcing a private link.
             - Default ports: AnyTLS TCP 8443 and subscription HTTPS TCP 443; open both host/cloud firewall ports. Use `--subscription-listen :9443` to override HTTPS only.
