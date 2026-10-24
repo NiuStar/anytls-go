@@ -444,17 +444,17 @@ is_public_ipv4() {
 }
 
 canonical_ipv6() {
-	local ip="$1" left right group gap i start=-1 length=0 best=-1 best_length=0 out=""
+	local ip="$1" left right group gap i start=-1 length=0 best=-1 best_length=0 out="" after_count=0
 	local -a before=() after=() full=()
 	if [[ "$ip" == *::* ]]; then
 		left="${ip%%::*}"; right="${ip#*::}"
 		IFS=: read -r -a before <<<"$left"
-		IFS=: read -r -a after <<<"$right"
-		gap=$((8 - ${#before[@]} - ${#after[@]}))
+		if [[ -n "$right" ]]; then IFS=: read -r -a after <<<"$right"; after_count=${#after[@]}; fi
+		gap=$((8 - ${#before[@]} - after_count))
 		((gap > 0)) || return 1
 		full=("${before[@]}")
 		for ((i=0; i<gap; i++)); do full+=(0); done
-		full+=("${after[@]}")
+		if ((after_count > 0)); then full+=("${after[@]}"); fi
 	else
 		IFS=: read -r -a full <<<"$ip"
 	fi
